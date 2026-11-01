@@ -9,8 +9,11 @@ The `codex/android-tv-controls` branch adds experimental TV control fixes:
 accessible controls are activated before touch gestures; gestures report their
 completion or cancellation; generic Enter and direct keyboard-key interaction are rejected on TV to prevent focused-letter insertion; searches use explicit application submit controls;
 application results take priority over keyboard suggestions. Failed, cancelled,
-and step-limited tasks remain failures in the chat, and unchanged screens stop
-repeated actions. Saved actions require fresh screen verification.
+and step-limited tasks remain failures in the chat. Task-local screen/action history
+lets the model recognize repeated navigation routes. A third identical action on
+the same observed screen is blocked, including across intervening screens or waits;
+three blocked proposals stop the task. The model can choose another visible route
+within the existing step limit. Saved actions require fresh screen verification.
 
 The tested configuration uses the Custom provider, base URL
 `https://api.openai.com/v1`, model `gpt-6.1-terra`, and a 4096-token response limit.

@@ -8,7 +8,6 @@ import 'notification_service.dart';
 import 'task_history_logger.dart';
 import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
-import 'recovery_engine.dart';
 import '../models/saved_skill.dart';
 import '../models/task_result.dart';
 import 'task_progress_guard.dart';
@@ -24,7 +23,6 @@ class TaskExecutor {
   final ShizukuService _shizukuService;
   final NotificationService _notificationService;
   final SkillMemoryService _skillMemory = SkillMemoryService();
-  final RecoveryEngine _recoveryEngine = RecoveryEngine();
 
   /// Callback to report progress messages to the UI
   final void Function(String message)? onProgress;
@@ -91,7 +89,7 @@ Rules:
 - Never type letters through the keyboard to submit. Use press_enter; if it fails, choose a visible search button or report failed.
 - If you need to find something by scrolling, scroll and then check the screen again.
 - If the requested app cannot be opened, report failed rather than opening an unrelated app.
-- If stuck after 3 attempts, use failed and explain in reasoning. Never report done for a failed task.
+- Consult RECENT ATTEMPTS before choosing an action. Screen IDs identify previously observed interfaces. Returning to an earlier screen is not new progress. After two ineffective attempts at the same control or navigation route, choose a different visible control or route. Do not keep alternating guide/player/menu, or re-open the same app to reset your strategy. Repeated actions on the same screen are blocked even across intervening steps. If no alternative exists, use failed and explain the obstacle. Never report done for a failed task.
 - Keep reasoning very brief (1 sentence)
 ''';
 
@@ -253,9 +251,10 @@ Rules:
         name: 'PrivateAgent',
       );
 
-      if (progressGuard.isStuck(screenContent, lastAction)) {
+      progressGuard.observe(screenContent);
+      if (progressGuard.shouldStop) {
         const message =
-            'Task stopped: three actions did not change the screen.';
+            'Task stopped: the agent repeated blocked strategies instead of choosing an alternative.';
         _report(message);
         await TaskHistoryLogger.logTask(userGoal, 'Failed', totalTokens, step, [
           ...results,
@@ -286,6 +285,7 @@ Rules:
 
 CURRENT SCREEN TEXT DUMP:
 $screenContent$prevResultStr$failureHint
+${progressGuard.context}
 Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. What is the next action?''';
 
       developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
@@ -485,6 +485,14 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
 
       _report('Step ${step + 1}: $reasoning');
 
+      final loopRejection = progressGuard.rejectionFor(action, params);
+      if (loopRejection != null) {
+        results.add(loopRejection);
+        _report(loopRejection);
+        // No UI action ran. Preserve the last actual action for observation.
+        continue;
+      }
+
       sameActionCount = action == lastAction ? sameActionCount + 1 : 1;
       final repeatLimit = action == 'press_enter'
           ? 2
@@ -496,7 +504,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         _report(blockedResult);
         consecutiveFailures = 3;
         lastFailedAction = action;
-        lastAction = action;
+        progressGuard.recordAttempt(action, params, false, blockedResult);
         continue;
       }
       lastAction = action; // Track for adaptive delay
@@ -620,6 +628,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           actionResult = 'Unknown action: $action';
       }
 
+      progressGuard.recordAttempt(action, params, success, actionResult);
       developer.log(
         '=== NATIVE EXECUTION RESULT ===\n$actionResult',
         name: 'PrivateAgent',
@@ -660,41 +669,9 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         }
 
         results.add('Step ${step + 1}: $actionResult ($reasoning)');
-        if (const {
-          'click_text',
-          'click_at',
-          'type_text',
-          'press_enter',
-        }.contains(action)) {
-          // A rejected interaction does not justify abandoning the current page.
-          // Give the next model observation the real failure and let it choose.
-          _report('Interaction rejected; checking the current screen.');
-          continue;
-        }
-
-        final recovery = await _recoveryEngine.diagnose(action, screenContent);
-        _report('Recovering: ${recovery.description}');
-
-        if (recovery.action == 'wait') {
-          await Future.delayed(const Duration(seconds: 2));
-        } else if (recovery.action == 'press_back') {
-          await _screenService.pressBack();
-        } else if (recovery.action == 'scroll') {
-          final dir = recovery.params['direction'] ?? 'down';
-          if (dir == 'down') {
-            await _shizukuService.runCommand(
-              'input swipe 540 1800 540 600 600',
-            );
-          } else {
-            await _shizukuService.runCommand(
-              'input swipe 540 600 540 1800 600',
-            );
-          }
-        } else if (recovery.action == 'press_home') {
-          await _screenService.pressHome();
-        }
-
-        results.add('Recovery step: ${recovery.description}');
+        // Observe the actual failed action before choosing a recovery route.
+        // An implicit Back/Home here would hide a second action from task memory.
+        _report('Interaction rejected; checking the current screen.');
         continue;
       } else {
         consecutiveFailures = 0;

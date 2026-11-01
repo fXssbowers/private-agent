@@ -17,6 +17,7 @@ class Screen extends ScreenAutomationService {
   bool running = true;
   bool acceptsClick = true;
   int backs = 0;
+  int clicks = 0;
   @override
   Future<bool> isServiceRunning() async => running;
   @override
@@ -25,7 +26,11 @@ class Screen extends ScreenAutomationService {
   Future<String> getCompressedScreenDescription(String task) async =>
       'Search results: Interstellar 2014';
   @override
-  Future<bool> clickAt(double x, double y) async => acceptsClick;
+  Future<bool> clickAt(double x, double y) async {
+    clicks++;
+    return acceptsClick;
+  }
+
   @override
   Future<bool> pressBack() async {
     backs++;
@@ -33,7 +38,35 @@ class Screen extends ScreenAutomationService {
   }
 
   @override
+  Future<bool> scroll(String direction, {String? target}) async => false;
+  @override
+  Future<bool> swipe(
+    double startX,
+    double startY,
+    double endX,
+    double endY,
+  ) async => false;
+  @override
   Future<void> showToast(String text) async {}
+}
+
+class CyclingScreen extends Screen {
+  String state = 'player';
+  int routeClicks = 0;
+  int searchClicks = 0;
+  @override
+  Future<String> getCompressedScreenDescription(String task) async => state;
+  @override
+  Future<bool> clickAt(double x, double y) async {
+    if (x == 10) {
+      routeClicks++;
+      state = state == 'player' ? 'guide' : 'player';
+    } else if (x == 20) {
+      searchClicks++;
+      state = 'requested search result';
+    }
+    return true;
+  }
 }
 
 class Notices extends NotificationService {
@@ -46,6 +79,7 @@ class Model extends AiService {
   Model(this.responses, {this.limit = 15});
   final int limit;
   int calls = 0;
+  final prompts = <String>[];
   Completer<AiResponse>? pending;
   Completer<AiResponse>? retryPending;
   @override
@@ -53,6 +87,7 @@ class Model extends AiService {
   @override
   Future<AiResponse> sendTaskMessage(String system, String prompt) {
     calls++;
+    prompts.add(prompt);
     if (calls > 1 && retryPending != null) return retryPending!.future;
     return pending?.future ??
         Future.value(AiResponse(responses.removeAt(0), 10));
@@ -97,32 +132,72 @@ void main() {
     await directory.delete(recursive: true);
   });
 
+  test('a two-screen cycle requires a different action on return', () {
+    final guard = TaskProgressGuard();
+    for (var i = 0; i < 2; i++) {
+      guard.observe('player');
+      expect(guard.rejectionFor('click_text', {'text': 'Guide'}), isNull);
+      guard.recordAttempt('click_text', {'text': 'Guide'}, true, 'Accepted');
+      guard.observe('guide');
+      guard.recordAttempt('press_back', {}, true, 'Accepted');
+    }
+    guard.observe('player');
+    expect(guard.context, contains('STRATEGY CHANGE REQUIRED'));
+    expect(guard.context, contains('"observed_after":"S2"'));
+    expect(guard.rejectionFor('click_text', {'text': 'Guide'}), isNotNull);
+    expect(guard.rejectionFor('click_text', {'text': 'Search'}), isNull);
+    expect(guard.rejectionFor('done', {}), isNull);
+  });
+  test('waits and app reopening cannot erase unsuccessful attempts', () {
+    final guard = TaskProgressGuard()..observe('guide');
+    guard.recordAttempt('click_text', {'text': 'Guide'}, true, 'Accepted');
+    guard.recordAttempt('wait', {}, true, 'Waited');
+    guard.observe('home');
+    guard.recordAttempt('open_app', {'app_name': 'TiviMate'}, true, 'Opened');
+    guard.observe('guide');
+    guard.recordAttempt('click_text', {'text': 'Guide'}, true, 'Accepted');
+    expect(guard.rejectionFor('click_text', {'text': 'Guide'}), isNotNull);
+  });
+  test('clock and tree-index changes do not evade repeated-action checks', () {
+    final guard = TaskProgressGuard();
+    for (var i = 0; i < 2; i++) {
+      guard.observe('APP: tv\n[3] textclock "01:24:10" center:(50,60)');
+      guard.recordAttempt('click_at', {'x': 50, 'y': 60}, true, 'Accepted');
+    }
+    guard.observe('APP: tv\n[9] textclock "01:24:13" center:(50,60)');
+    expect(guard.rejectionFor('click_at', {'y': 60.0, 'x': 50.0}), isNotNull);
+  });
   test(
-    'unchanged UI stops after three attempts even when clicks report accepted',
+    'new controls, query content and application identity remain distinct',
     () {
       final guard = TaskProgressGuard();
-      expect(guard.isStuck('screen A', ''), false);
-      expect(guard.isStuck('screen A', 'click_at'), false);
-      expect(guard.isStuck('screen A', 'click_text'), false);
-      expect(guard.isStuck('screen A', 'press_enter'), true);
+      guard.observe('APP: tv "Search 2014" center:(50,60)');
+      guard.recordAttempt('click_at', {'x': 50, 'y': 60}, true, 'Accepted');
+      guard.recordAttempt('click_at', {'x': 50, 'y': 60}, true, 'Accepted');
+      for (final screen in [
+        'APP: tv "Results 2014" center:(50,60)',
+        'APP: tv "Search 2015" center:(50,60)',
+        'APP: film "Search 2014" center:(50,60)',
+      ]) {
+        guard.observe(screen);
+        expect(guard.rejectionFor('click_at', {'x': 50, 'y': 60}), isNull);
+      }
+      final nextTask = TaskProgressGuard()
+        ..observe('APP: tv "Search 2014" center:(50,60)');
+      expect(nextTask.rejectionFor('click_at', {'x': 50, 'y': 60}), isNull);
     },
   );
-  test('new UI resets the no-progress counter and waits do not count', () {
+  test('time-valued queries and result titles are not mistaken for clocks', () {
     final guard = TaskProgressGuard();
-    guard.isStuck('A', '');
-    guard.isStuck('A', 'click_at');
-    expect(guard.isStuck('B', 'click_at'), false);
-    expect(guard.isStuck('B', 'wait'), false);
-    expect(guard.isStuck('B', 'click_at'), false);
-  });
-  test('intermediate waits cannot hide three ineffective interactions', () {
-    final guard = TaskProgressGuard();
-    guard.isStuck('A', '');
-    expect(guard.isStuck('A', 'click_at'), false);
-    expect(guard.isStuck('A', 'wait'), false);
-    expect(guard.isStuck('A', 'click_at'), false);
-    expect(guard.isStuck('A', 'wait'), false);
-    expect(guard.isStuck('A', 'click_at'), true);
+    guard.observe(
+      'APP: film\n[1] input "12:30" [edit] center:(50,60)\n[2] text "12:30" [tap]',
+    );
+    guard.recordAttempt('click_at', {'x': 50, 'y': 60}, true, 'Accepted');
+    guard.recordAttempt('click_at', {'x': 50, 'y': 60}, true, 'Accepted');
+    guard.observe(
+      'APP: film\n[1] input "13:30" [edit] center:(50,60)\n[2] text "13:30" [tap]',
+    );
+    expect(guard.rejectionFor('click_at', {'x': 50, 'y': 60}), isNull);
   });
   test(
     'a rejected click preserves the page for the next observation',
@@ -138,6 +213,19 @@ void main() {
       expect(screen.backs, 0);
     },
   );
+  test('rejected scrolling has no hidden navigation recovery', () async {
+    final ai = Model([
+      '{"action":"scroll","params":{"direction":"down"}}',
+      '{"action":"failed","reasoning":"No other visible route"}',
+    ]);
+    final screen = Screen();
+    final result = await executor(ai, screen).executeTask('search');
+    expect(result.status, TaskStatus.failed);
+    expect(screen.backs, 0);
+    expect(ai.prompts[1], contains('Could not scroll down'));
+    expect(ai.prompts[1], contains('"accepted_by_android":false'));
+    expect(ai.prompts[1], contains('"observed_after":"S1"'));
+  });
   test(
     'rejected native submit cannot inject shell Enter, even if authorized',
     () async {
@@ -214,18 +302,41 @@ void main() {
     },
   );
   test(
-    'accepted clicks on unchanged screen stop without another model request',
+    'repeated proposals are blocked before dispatch and stop honestly',
     () async {
       final ai = Model(
         List.generate(
-          4,
+          5,
           (_) => '{"action":"click_at","params":{"x":50,"y":50}}',
         ),
       );
-      final result = await executor(ai, Screen()).executeTask('search');
-      expect(result.success, false);
-      expect(result.message, contains('three actions'));
-      expect(ai.calls, 3);
+      final screen = Screen();
+      final result = await executor(ai, screen).executeTask('search');
+      expect(result.status, TaskStatus.failed);
+      expect(result.message, contains('blocked strategies'));
+      expect(ai.calls, 5);
+      expect(screen.clicks, 2);
+      expect(ai.prompts[2], contains('STRATEGY CHANGE REQUIRED'));
+      expect(ai.prompts[3], contains('"dispatched":false'));
+    },
+  );
+  test(
+    'an alternative route remains executable after a detected cycle',
+    () async {
+      final ai = Model([
+        ...List.filled(5, '{"action":"click_at","params":{"x":10,"y":50}}'),
+        '{"action":"click_at","params":{"x":20,"y":50}}',
+        '{"action":"done","reasoning":"Requested search result visible"}',
+      ]);
+      final screen = CyclingScreen();
+      final result = await executor(ai, screen).executeTask('search');
+      expect(result.status, TaskStatus.succeeded);
+      expect(screen.routeClicks, 4);
+      expect(screen.searchClicks, 1);
+      expect(screen.state, 'requested search result');
+      expect(ai.prompts[4], contains('STRATEGY CHANGE REQUIRED'));
+      expect(ai.prompts[5], contains('"dispatched":false'));
+      expect(ai.prompts.last, contains('requested search result'));
     },
   );
   test('cancellation while waiting for AI propagates cancellation', () async {
