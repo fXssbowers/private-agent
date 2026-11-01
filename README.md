@@ -7,7 +7,7 @@ PrivateAgent is an open-source Android automation agent built with Flutter. It u
 
 The `codex/android-tv-controls` branch adds experimental TV control fixes:
 accessible controls are activated before touch gestures; gestures report their
-completion or cancellation; generic Enter is rejected on TV to prevent focused-letter insertion; searches use explicit application submit controls;
+completion or cancellation; generic Enter and direct keyboard-key interaction are rejected on TV to prevent focused-letter insertion; searches use explicit application submit controls;
 application results take priority over keyboard suggestions. Failed, cancelled,
 and step-limited tasks remain failures in the chat, and unchanged screens stop
 repeated actions. Saved actions require fresh screen verification.

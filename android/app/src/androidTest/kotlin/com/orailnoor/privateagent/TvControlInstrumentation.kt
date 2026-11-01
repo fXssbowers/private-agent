@@ -44,9 +44,9 @@ class TvControlInstrumentation : Instrumentation() {
                         val field = nodes(control).first { it["isEditable"] == true }
                         val fb = field["bounds"] as Map<*, *>
                         val buttons = nodes(control).filter { node ->
-                            val bounds = node["bounds"] as Map<*, *>
-                            node["className"] == "Button" && node["isClickable"] == true &&
-                                (bounds["top"] as Int) >= (fb["top"] as Int) &&
+                            if (node["className"] != "Button" || node["isClickable"] != true) return@filter false
+                            val bounds = node["bounds"] as? Map<*, *> ?: return@filter false
+                            (bounds["top"] as Int) >= (fb["top"] as Int) &&
                                 (bounds["bottom"] as Int) <= (fb["bottom"] as Int) &&
                                 (bounds["left"] as Int) >= (fb["left"] as Int) &&
                                 (bounds["right"] as Int) <= (fb["right"] as Int)
@@ -79,6 +79,12 @@ class TvControlInstrumentation : Instrumentation() {
                     check(action { done -> done(control.typeText("Interstellar", "Film")) }) { "Text entry rejected" }
                     SystemClock.sleep(400)
                     checkQuery(control, "after typing")
+                    check(nodes(control).any { it["className"] == "KeyboardStatus" }) { "Open TV keyboard was not detected" }
+                    check(nodes(control).none { it["text"]?.toString() == "q" }) { "TV keyboard keys leaked into app controls" }
+                    check(!action { control.clickByText("q", it) }) { "Keyboard letter was exposed as app control" }
+                    action { control.clickAtCoordinates(600f, 750f, it) }
+                    SystemClock.sleep(400)
+                    checkQuery(control, "after rejected keyboard interaction")
                     val field = nodes(control).first { it["isEditable"] == true }
                     val fieldBounds = field["bounds"] as Map<*, *>
                     val fieldX = ((fieldBounds["left"] as Int) + (fieldBounds["right"] as Int)) / 2f

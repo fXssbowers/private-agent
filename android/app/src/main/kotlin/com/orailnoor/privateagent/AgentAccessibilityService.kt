@@ -3,6 +3,7 @@ package com.orailnoor.privateagent
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
+import android.provider.Settings
 import android.graphics.Bitmap
 import android.hardware.HardwareBuffer
 import android.graphics.Path
@@ -83,6 +84,30 @@ class AgentAccessibilityService : AccessibilityService() {
         instance = null
     }
 
+    private fun isTelevisionDevice(): Boolean =
+        packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK) ||
+            packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TELEVISION)
+
+    private fun isKeyboardPackage(root: AccessibilityNodeInfo): Boolean {
+        val imePackage = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)
+            ?.substringBefore('/')
+        return !imePackage.isNullOrEmpty() && root.packageName?.toString() == imePackage
+    }
+
+    private fun isKeyboardWindow(window: AccessibilityWindowInfo, root: AccessibilityNodeInfo): Boolean =
+        window.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD || isKeyboardPackage(root)
+
+    private fun keyboardOpenOnTv(): Boolean {
+        if (!isTelevisionDevice()) return false
+        for (window in windows) {
+            val root = window.root ?: continue
+            val keyboard = isKeyboardWindow(window, root)
+            root.recycle()
+            if (keyboard) return true
+        }
+        return false
+    }
+
     // ─── Screen Reading ──────────────────────────────────────────
 
     /** Dump the current screen as a flat list of UI elements */
@@ -91,15 +116,27 @@ class AgentAccessibilityService : AccessibilityService() {
         val allWindows = windows
         if (allWindows == null || allWindows.isEmpty()) {
             val root = rootInActiveWindow ?: return emptyList()
-            if (root.packageName?.toString() != ownPackageName) {
+            if (root.packageName?.toString() != ownPackageName &&
+                !(isTelevisionDevice() && isKeyboardPackage(root))) {
                 traverseNode(root, nodes, 0)
             }
             root.recycle()
             return nodes
         }
         
+        var keyboardReported = false
         for (window in allWindows) {
             val root = window.root ?: continue
+            if (isTelevisionDevice() && isKeyboardWindow(window, root)) {
+                if (!keyboardReported) {
+                    nodes.add(mapOf("index" to nodes.size, "text" to "TV keyboard open: use app Search control.",
+                        "className" to "KeyboardStatus", "isClickable" to false, "isEditable" to false,
+                        "isScrollable" to false, "depth" to 0))
+                    keyboardReported = true
+                }
+                root.recycle()
+                continue
+            }
             if (root.packageName?.toString() == ownPackageName) {
                 root.recycle()
                 continue
@@ -212,7 +249,8 @@ class AgentAccessibilityService : AccessibilityService() {
             for (window in orderedWindows) {
                 for (exact in listOf(true, false)) {
                     val root = window.root ?: continue
-                    if (root.packageName?.toString() == ownPackageName) {
+                    if (root.packageName?.toString() == ownPackageName ||
+                (isTelevisionDevice() && isKeyboardWindow(window, root))) {
                         root.recycle(); continue
                     }
                     val node = findTextNode(root, targetText, exact, skipEditable)
@@ -223,7 +261,7 @@ class AgentAccessibilityService : AccessibilityService() {
                         node.getBoundsInScreen(rect)
                         node.recycle()
                         if (clicked) callback(true)
-                        else if (!rect.isEmpty) dispatchTap(rect.centerX().toFloat(), rect.centerY().toFloat(), callback)
+                        else if (!rect.isEmpty && !keyboardOpenOnTv()) dispatchTap(rect.centerX().toFloat(), rect.centerY().toFloat(), callback)
                         else callback(false)
                         return
                     }
@@ -277,10 +315,12 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     fun clickAtCoordinates(x: Float, y: Float, callback: (Boolean) -> Unit) {
-        if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0) { callback(false); return }
+        if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0 ||
+            (isTelevisionDevice() && windows.isEmpty())) { callback(false); return }
         for (window in windows) {
             val root = window.root ?: continue
-            if (root.packageName?.toString() == ownPackageName) { root.recycle(); continue }
+            if (root.packageName?.toString() == ownPackageName ||
+                (isTelevisionDevice() && isKeyboardWindow(window, root))) { root.recycle(); continue }
             val node = findClickableAt(root, x.toInt(), y.toInt())
             root.recycle()
             if (node != null) {
@@ -290,7 +330,7 @@ class AgentAccessibilityService : AccessibilityService() {
                 break
             }
         }
-        dispatchTap(x, y, callback)
+        if (keyboardOpenOnTv()) callback(false) else dispatchTap(x, y, callback)
     }
 
     private fun dispatchTap(x: Float, y: Float, callback: (Boolean) -> Unit) {
@@ -325,7 +365,8 @@ class AgentAccessibilityService : AccessibilityService() {
     fun typeText(text: String, fieldHint: String? = null): Boolean {
         for (window in windows) {
             val root = window.root ?: continue
-            if (root.packageName?.toString() == ownPackageName) {
+            if (root.packageName?.toString() == ownPackageName ||
+                (isTelevisionDevice() && isKeyboardWindow(window, root))) {
                 root.recycle()
                 continue
             }
@@ -353,8 +394,7 @@ class AgentAccessibilityService : AccessibilityService() {
         // On TV the generic Enter action can activate the keyboard's focused
         // letter instead of submitting the editor. Leave the query intact and
         // let the agent activate the application's explicit search control.
-        if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK) ||
-            packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TELEVISION)) {
+        if (isTelevisionDevice()) {
             callback(false)
             return
         }
@@ -373,7 +413,8 @@ class AgentAccessibilityService : AccessibilityService() {
             for (window in windows) {
                 if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
                 val root = window.root ?: continue
-                if (root.packageName?.toString() == ownPackageName) { root.recycle(); continue }
+                if (root.packageName?.toString() == ownPackageName ||
+                (isTelevisionDevice() && isKeyboardWindow(window, root))) { root.recycle(); continue }
                 val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
                 val submitted = focused?.isEditable == true && focused.performAction(
                     AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
@@ -434,7 +475,8 @@ class AgentAccessibilityService : AccessibilityService() {
     fun scroll(direction: String, targetText: String? = null): Boolean {
         for (window in windows) {
             val root = window.root ?: continue
-            if (root.packageName?.toString() == ownPackageName) {
+            if (root.packageName?.toString() == ownPackageName ||
+                (isTelevisionDevice() && isKeyboardWindow(window, root))) {
                 root.recycle()
                 continue
             }
@@ -525,6 +567,10 @@ class AgentAccessibilityService : AccessibilityService() {
 
         for (window in windows) {
             val root = window.root ?: continue
+            if (isTelevisionDevice() && isKeyboardWindow(window, root)) {
+                root.recycle()
+                continue
+            }
             val pkg = root.packageName?.toString()
             root.recycle()
 
