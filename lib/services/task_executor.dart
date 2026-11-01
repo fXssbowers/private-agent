@@ -10,6 +10,8 @@ import 'shizuku_service.dart';
 import 'skill_memory_service.dart';
 import 'recovery_engine.dart';
 import '../models/saved_skill.dart';
+import '../models/task_result.dart';
+import 'task_progress_guard.dart';
 
 /// Executes multi-step UI automation tasks using LLM-guided screen reading.
 ///
@@ -20,7 +22,7 @@ class TaskExecutor {
   final ScreenAutomationService _screenService;
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
-  final NotificationService _notificationService = NotificationService();
+  final NotificationService _notificationService;
   final SkillMemoryService _skillMemory = SkillMemoryService();
   final RecoveryEngine _recoveryEngine = RecoveryEngine();
 
@@ -37,10 +39,12 @@ class TaskExecutor {
     required AppLauncherService appLauncher,
     required ShizukuService shizukuService,
     this.onProgress,
+    NotificationService? notificationService,
   }) : _aiService = aiService,
        _screenService = screenService,
        _appLauncher = appLauncher,
-       _shizukuService = shizukuService;
+       _shizukuService = shizukuService,
+       _notificationService = notificationService ?? NotificationService();
 
   /// Cancel the currently running task — takes effect immediately
   void cancel() {
@@ -51,7 +55,7 @@ class TaskExecutor {
   }
 
   static const String _taskSystemPrompt = '''
-You are a phone automation agent. You are given a TASK and the current SCREEN content.
+You are an Android automation agent, including Android TV. You are given a TASK and the current SCREEN content.
 You must decide what single action to take next to accomplish the task.
 
 Respond with ONLY a JSON object (no markdown, no code fences):
@@ -73,19 +77,21 @@ Available actions:
 - press_home: {} - Press the home button
 - open_app: {"app_name": "WhatsApp"} - Open an app
 - wait: {} - Wait a moment for content to load
-- done: {} - Task is complete
+- done: {} - Task is complete and the current screen confirms the requested result
+- failed: {} - Task cannot be completed; explain the obstacle
 
 Rules:
 - You will receive a TEXT DUMP of the accessibility tree containing exact text strings and center coordinates.
 - ALWAYS use the text dump to decide your next action.
 - If you need to click something, prefer using `click_text`. If the element does not have text, use `click_at` with the coordinates provided in the text dump.
-- When typing in a search box, you MUST click it first, wait a step, and THEN type.
-- After typing a search query, use `press_enter` once. If the screen does not change, click the exact visible suggestion text. Do not repeat the same submit action more than twice.
+- Click a search field before typing on the next observation. The executor already waits after each action; use wait only when content is visibly loading.
+- After typing a search query, use press_enter at most once. It is unsupported on Android TV because it can type the focused keyboard letter. If rejected, keep the query and activate the application's explicit search/submit control: look for a clickable Button inside or next to the editable field, even if it has no text. Do not retry Enter or press a letter key. Dismiss the keyboard with press_back only if it is visibly open.
 - Never scroll or swipe more than three times in a row. After three scrolls, choose the best visible result or take a different action instead of continuing to browse indefinitely.
-- Set is_complete=true ONLY when the task is fully done.
+- Use done ONLY after reading a subsequent screen that confirms the requested result. An accepted click or opened app does not prove the full task succeeded.
+- Never type letters through the keyboard to submit. Use press_enter; if it fails, choose a visible search button or report failed.
 - If you need to find something by scrolling, scroll and then check the screen again.
-- If you need to open an app (like Wikipedia, Spotify, etc.) and you cannot find it after a couple of scrolls, ASSUME it is not installed. Immediately open Chrome or Google to search for the info on the web instead.
-- If stuck after 3 attempts, set is_complete=true and explain in reasoning.
+- If the requested app cannot be opened, report failed rather than opening an unrelated app.
+- If stuck after 3 attempts, use failed and explain in reasoning. Never report done for a failed task.
 - Keep reasoning very brief (1 sentence)
 ''';
 
@@ -109,7 +115,7 @@ Rules:
   }
 
   /// Execute a multi-step task with LLM guidance
-  Future<String> executeTask(String userGoal) async {
+  Future<TaskResult> executeTask(String userGoal) async {
     await ScreenAutomationService.logToNative(
       "[TaskExecutor] executeTask() CALLED with goal: $userGoal",
     );
@@ -126,13 +132,18 @@ Rules:
       await ScreenAutomationService.logToNative(
         "[TaskExecutor] Accessibility service not running, returning early.",
       );
-      return 'Accessibility service is not enabled. Go to Settings \u2192 Accessibility \u2192 PrivateAgent Screen Control and enable it.';
+      return const TaskResult(
+        TaskStatus.failed,
+        'Accessibility service is not enabled. Enable PrivateAgent Screen Control.',
+      );
     }
 
     final results = <String>[];
     results.add('Starting task: $userGoal');
     _report('Starting task: $userGoal');
 
+    bool replayed = false;
+    final replayedSteps = <ActionStep>[];
     // Check skill memory first
     final savedSkill = await _skillMemory.findSkill(userGoal);
     if (savedSkill != null && savedSkill.isReliable) {
@@ -141,21 +152,12 @@ Rules:
       );
       final replaySuccess = await _replaySkill(savedSkill, results);
       if (replaySuccess) {
-        results.add('Task complete via skill memory.');
-        _report('Task complete (via skill memory).');
-        await _notificationService.showTaskCompleteNotification(
-          'Task Completed',
-          'Agent finished its goal using memory.',
-        );
-        await TaskHistoryLogger.logTask(
-          userGoal,
-          'Success',
-          0,
-          savedSkill.steps.length,
-          results,
-        );
-        await _screenService.showToast('Task Complete! (Memory)');
-        return 'Done.';
+        // A replay only performs actions. Verify the current screen with the AI
+        // before announcing success or reinforcing the saved sequence.
+        replayed = true;
+        replayedSteps.addAll(savedSkill.steps);
+        results.add('Saved actions replayed; checking the current screen.');
+        _report('Verifying the result of saved actions...');
       } else {
         _report('Replay failed, falling back to AI...');
         await _skillMemory.recordFailure(savedSkill.id);
@@ -163,13 +165,14 @@ Rules:
     }
 
     // Smart pre-launch shortcuts: execute common sequences without LLM
-    final shortcut = _getNavigationShortcut(userGoal);
-    String lastAction = '';
+    final shortcut = replayed ? null : _getNavigationShortcut(userGoal);
+    String lastAction = replayedSteps.isEmpty ? '' : replayedSteps.last.action;
+    final progressGuard = TaskProgressGuard();
     int sameActionCount = 0;
     int consecutiveFailures = 0;
     String lastFailedAction = '';
     int totalTokens = 0;
-    final List<ActionStep> executedSteps = [];
+    final List<ActionStep> executedSteps = [...replayedSteps];
 
     if (shortcut != null && shortcut.isNotEmpty) {
       results.add('Using navigation shortcut: ${shortcut.length} steps');
@@ -224,7 +227,7 @@ Rules:
           results,
         );
         await _screenService.showToast('Task Cancelled');
-        return 'Task cancelled.';
+        return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
       }
 
       // Adaptive delay: give Android apps time to transition screens, load data, or open keyboards
@@ -249,6 +252,21 @@ Rules:
         '=== SCREEN DUMP (Step ${step + 1}) ===\n$screenContent',
         name: 'PrivateAgent',
       );
+
+      if (progressGuard.isStuck(screenContent, lastAction)) {
+        const message =
+            'Task stopped: three actions did not change the screen.';
+        _report(message);
+        await TaskHistoryLogger.logTask(userGoal, 'Failed', totalTokens, step, [
+          ...results,
+          message,
+        ]);
+        await _notificationService.showTaskCompleteNotification(
+          'Task Stopped',
+          message,
+        );
+        return const TaskResult(TaskStatus.failed, message);
+      }
 
       // Determine previous result string
       final prevResultStr = step > 0 && results.isNotEmpty
@@ -299,7 +317,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
             results,
           );
           await _screenService.showToast('Task Cancelled');
-          return 'Task cancelled.';
+          return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
         }
 
         final aiResponse = result as AiResponse;
@@ -327,7 +345,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           );
           await _screenService.showToast('Task Cancelled');
           await Future.delayed(const Duration(seconds: 2));
-          return 'Task cancelled.';
+          return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
         }
         results.add('AI error: $e');
         _report('Error: $e');
@@ -344,7 +362,10 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         );
         await _screenService.showToast('AI Error: $e');
         await Future.delayed(const Duration(seconds: 3));
-        return 'I could not complete the task because the AI service failed.';
+        return const TaskResult(
+          TaskStatus.failed,
+          'I could not complete the task because the AI service failed.',
+        );
       }
 
       // Check for cancellation after AI response
@@ -364,17 +385,15 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         );
         await _screenService.showToast('Task Cancelled');
         await Future.delayed(const Duration(seconds: 2));
-        return 'Task cancelled.';
+        return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
       }
 
       // 4. Parse the action (with one retry on failure)
       Map<String, dynamic>? actionJson;
-      String? parsedJsonStr;
       try {
         String jsonStr = _extractJson(response);
 
         actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
-        parsedJsonStr = jsonStr;
       } catch (firstError) {
         // First attempt failed — retry once
         developer.log(
@@ -385,10 +404,31 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         // Wait 2 seconds before retrying to prevent rate-limit spam
         await Future.delayed(const Duration(seconds: 2));
         try {
-          final retryResponse = await _aiService.sendTaskMessage(
-            _taskSystemPrompt,
-            prompt,
-          );
+          if (_cancelled) {
+            await TaskHistoryLogger.logTask(
+              userGoal,
+              'Cancelled',
+              totalTokens,
+              step,
+              results,
+            );
+            return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
+          }
+          final retryResponse = await Future.any<AiResponse?>([
+            _aiService.sendTaskMessage(_taskSystemPrompt, prompt),
+            _cancelCompleter!.future.then((_) => null),
+          ]);
+          if (retryResponse == null || _cancelled) {
+            _report('Task cancelled.');
+            await TaskHistoryLogger.logTask(
+              userGoal,
+              'Cancelled',
+              totalTokens,
+              step,
+              [...results, 'Task cancelled.'],
+            );
+            return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
+          }
           totalTokens += retryResponse.totalTokens;
           developer.log(
             '=== RETRY AI RESPONSE ===\n${retryResponse.content}',
@@ -397,7 +437,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
 
           String jsonStr = _extractJson(retryResponse.content);
           actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
-          parsedJsonStr = jsonStr;
         } catch (e) {
           results.add('Step ${step + 1}: Error after retry: $e');
 
@@ -417,14 +456,27 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           );
           await _screenService.showToast('Agent Error: $e');
           await Future.delayed(const Duration(seconds: 3));
-          return 'I could not understand the AI response. Please try again.';
+          return const TaskResult(
+            TaskStatus.failed,
+            'I could not understand the AI response. Please try again.',
+          );
         }
       }
 
-      final action = actionJson['action'] as String? ?? 'done';
+      if (_cancelled) {
+        await TaskHistoryLogger.logTask(
+          userGoal,
+          'Cancelled',
+          totalTokens,
+          step,
+          results,
+        );
+        return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
+      }
+      final action = actionJson['action'] as String? ?? 'failed';
       final params = actionJson['params'] as Map<String, dynamic>? ?? {};
       final reasoning = actionJson['reasoning'] as String? ?? '';
-      final isComplete = actionJson['is_complete'] == true;
+      final isComplete = action == 'done';
 
       developer.log(
         '=== PARSED ACTION ===\nAction: $action\nParams: $params\nReasoning: $reasoning\nIs Complete: $isComplete',
@@ -477,7 +529,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           break;
 
         case 'press_enter':
-          success = await _submitKeyboardAction();
+          success = await _screenService.pressEnter();
           actionResult = success
               ? 'Submitted the focused search/form field'
               : 'Could not submit the focused field';
@@ -523,6 +575,24 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           success = true;
           break;
 
+        case 'failed':
+          final message = reasoning.trim().isEmpty
+              ? 'Agent could not complete the task.'
+              : reasoning.trim();
+          _report(message);
+          await TaskHistoryLogger.logTask(
+            userGoal,
+            'Failed',
+            totalTokens,
+            step,
+            [...results, message],
+          );
+          await _notificationService.showTaskCompleteNotification(
+            'Task Failed',
+            message,
+          );
+          return TaskResult(TaskStatus.failed, message);
+
         case 'done':
           results.add('Task complete: $reasoning');
           _report('Task complete: $reasoning');
@@ -530,8 +600,21 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
             'Task Completed',
             reasoning.trim().isEmpty ? 'Agent finished its goal.' : reasoning,
           );
+          await TaskHistoryLogger.logTask(
+            userGoal,
+            'Success',
+            totalTokens,
+            step,
+            results,
+          );
+          if (executedSteps.isNotEmpty) {
+            await _skillMemory.saveSkill(userGoal, executedSteps);
+          }
           await _screenService.showToast('Task completed');
-          return reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
+          return TaskResult(
+            TaskStatus.succeeded,
+            reasoning.trim().isEmpty ? 'Done.' : reasoning.trim(),
+          );
 
         default:
           actionResult = 'Unknown action: $action';
@@ -570,7 +653,23 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           );
           await _screenService.showToast('Agent stuck. Task stopped.');
           await Future.delayed(const Duration(seconds: 4));
-          return 'I could not complete the task. Please try again.';
+          return const TaskResult(
+            TaskStatus.failed,
+            'I could not complete the task. Please try again.',
+          );
+        }
+
+        results.add('Step ${step + 1}: $actionResult ($reasoning)');
+        if (const {
+          'click_text',
+          'click_at',
+          'type_text',
+          'press_enter',
+        }.contains(action)) {
+          // A rejected interaction does not justify abandoning the current page.
+          // Give the next model observation the real failure and let it choose.
+          _report('Interaction rejected; checking the current screen.');
+          continue;
         }
 
         final recovery = await _recoveryEngine.diagnose(action, screenContent);
@@ -609,30 +708,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       if (!isComplete && (step + 1) % 3 == 0) {
         await _screenService.showToast('Working... (Step ${step + 1})');
       }
-
-      if (isComplete) {
-        results.add('Task complete.');
-        _report('Task complete.');
-        await _notificationService.showTaskCompleteNotification(
-          'Task Completed',
-          'Agent finished its goal.',
-        );
-        await TaskHistoryLogger.logTask(
-          userGoal,
-          'Success',
-          totalTokens,
-          step,
-          results,
-        );
-
-        // Save to skill memory
-        await _skillMemory.saveSkill(userGoal, executedSteps);
-
-        await _screenService.showToast('Task Complete!');
-        // Wait 4 seconds so the user can see the result before jumping back
-        await Future.delayed(const Duration(seconds: 4));
-        return reasoning.trim().isEmpty ? 'Done.' : reasoning.trim();
-      }
     }
 
     results.add(
@@ -653,24 +728,14 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
     await _screenService.showToast('Reached maximum steps.');
     await Future.delayed(const Duration(seconds: 4));
 
-    return 'I could not complete the task within the allowed steps.';
+    return const TaskResult(
+      TaskStatus.failed,
+      'I could not complete the task within the allowed steps.',
+    );
   }
 
   void _report(String message) {
     onProgress?.call(message);
-  }
-
-  Future<bool> _submitKeyboardAction() async {
-    if (await _screenService.pressEnter()) return true;
-
-    final shizukuAvailable = await _shizukuService.checkAvailability();
-    if (!shizukuAvailable) return false;
-
-    final result = await _shizukuService.runCommand('input keyevent 66');
-    final normalized = result.toLowerCase();
-    return !normalized.contains('not running') &&
-        !normalized.contains('permission denied') &&
-        !normalized.startsWith('error');
   }
 
   Future<bool> _performScroll(String direction) async {
@@ -689,7 +754,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
     if (await _screenService.swipe(startX, startY, endX, endY)) return true;
 
     final shizukuAvailable = await _shizukuService.checkAvailability();
-    if (!shizukuAvailable) return false;
+    if (!shizukuAvailable || !_shizukuService.hasPermission) return false;
 
     final result = await _shizukuService.runCommand(
       'input swipe ${startX.toInt()} ${startY.toInt()} '
@@ -746,7 +811,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           actionResult = success ? 'Typed "$text"' : 'Could not type text';
           break;
         case 'press_enter':
-          success = await _submitKeyboardAction();
+          success = await _screenService.pressEnter();
           actionResult = success
               ? 'Submitted the focused search/form field'
               : 'Could not submit the focused field';

@@ -124,7 +124,7 @@ class MainActivity : FlutterActivity() {
                             if (service == null) {
                                 result.error("SERVICE_NOT_RUNNING", "Accessibility service is not running", null)
                             } else {
-                                result.success(service.clickByText(text))
+                                service.clickByText(text) { result.success(it) }
                             }
                         }
 
@@ -135,7 +135,7 @@ class MainActivity : FlutterActivity() {
                             if (service == null) {
                                 result.error("SERVICE_NOT_RUNNING", "Accessibility service is not running", null)
                             } else {
-                                result.success(service.clickAtCoordinates(x, y))
+                                service.clickAtCoordinates(x, y) { result.success(it) }
                             }
                         }
 
@@ -155,7 +155,7 @@ class MainActivity : FlutterActivity() {
                             if (service == null) {
                                 result.error("SERVICE_NOT_RUNNING", "Accessibility service is not running", null)
                             } else {
-                                result.success(service.pressEnter())
+                                service.pressEnter { result.success(it) }
                             }
                         }
 
@@ -185,7 +185,7 @@ class MainActivity : FlutterActivity() {
                             if (service == null) {
                                 result.error("SERVICE_NOT_RUNNING", "Accessibility service is not running", null)
                             } else {
-                                result.success(service.swipe(startX, startY, endX, endY))
+                                service.swipe(startX, startY, endX, endY, { result.success(it) })
                             }
                         }
 

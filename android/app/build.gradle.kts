@@ -25,14 +25,23 @@ android {
         applicationId = "com.orailnoor.privateagent"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
+        testInstrumentationRunner = "com.orailnoor.privateagent.TvControlInstrumentation"
         minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
+    testBuildType = "release"
+
     buildTypes {
         release {
+            // Real-device instrumentation needs stable target bytecode. This
+            // opt-in is for the test APK pair; normal release builds stay optimized.
+            if (providers.gradleProperty("nativeControlTests").orNull == "true") {
+                isMinifyEnabled = false
+                isShrinkResources = false
+            }
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")

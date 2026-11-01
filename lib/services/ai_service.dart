@@ -196,6 +196,46 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     return _maxTokens;
   }
 
+  /// Keep provider-specific request parameters consistent across chat and tasks.
+  static Map<String, dynamic> buildChatRequest({
+    required String baseUrl,
+    required String model,
+    required List<Map<String, dynamic>> messages,
+    required double temperature,
+    required int maxTokens,
+    bool stream = false,
+  }) {
+    final endpoint = Uri.tryParse(baseUrl);
+    final terra =
+        endpoint?.scheme == 'https' &&
+        endpoint?.host == 'api.openai.com' &&
+        model == 'gpt-6.1-terra';
+    return {
+      'model': model,
+      'messages': messages,
+      if (terra) ...{
+        'max_completion_tokens': maxTokens,
+        'reasoning_effort': 'medium',
+      } else ...{
+        'temperature': temperature,
+        'max_tokens': maxTokens,
+      },
+      if (stream) 'stream': true,
+    };
+  }
+
+  Map<String, dynamic> _requestBody(
+    List<Map<String, dynamic>> messages, {
+    bool stream = false,
+  }) => buildChatRequest(
+    baseUrl: _baseUrl,
+    model: _model,
+    messages: messages,
+    temperature: _temperature,
+    maxTokens: _effectiveMaxTokens,
+    stream: stream,
+  );
+
   void clearHistory() {
     _conversationHistory.clear();
   }
@@ -240,12 +280,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         }
       }
 
-      final requestBody = jsonEncode({
-        'model': _model,
-        'messages': messages,
-        'temperature': _temperature,
-        'max_tokens': _effectiveMaxTokens,
-      });
+      final requestBody = jsonEncode(_requestBody(messages));
 
       developer.log(
         'API Request: $requestUrl\n$requestBody',
@@ -361,13 +396,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
         'X-Title': 'PrivateAgent',
       });
 
-      request.body = jsonEncode({
-        'model': _model,
-        'messages': messages,
-        'temperature': _temperature,
-        'max_tokens': _effectiveMaxTokens,
-        'stream': true,
-      });
+      request.body = jsonEncode(_requestBody(messages, stream: true));
 
       final response = await client
           .send(request)
@@ -503,12 +532,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
                 'HTTP-Referer': 'https://github.com/orailnoor/private-agent',
                 'X-Title': 'PrivateAgent',
               },
-              body: jsonEncode({
-                'model': _model,
-                'messages': messages,
-                'temperature': _temperature,
-                'max_tokens': _effectiveMaxTokens,
-              }),
+              body: jsonEncode(_requestBody(messages)),
             )
             .timeout(const Duration(minutes: 30));
 

@@ -254,7 +254,7 @@ class _OverlayAppState extends State<OverlayApp> {
             if (mounted) {
               final resultMessage = ChatMessage(
                 role: 'assistant',
-                content: res,
+                content: res.message,
               );
               setState(() {
                 _isSent = false;

@@ -9,6 +9,8 @@ import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
@@ -202,82 +204,122 @@ class AgentAccessibilityService : AccessibilityService() {
 
     // ─── Actions ─────────────────────────────────────────────────
 
-    /** Find and click a node by its text content */
-    fun clickByText(targetText: String): Boolean {
-        for (window in windows) {
-            val root = window.root ?: continue
-            if (root.packageName?.toString() == ownPackageName) {
-                root.recycle()
-                continue
+    /** Resolve an actual accessible control before falling back to a gesture. */
+    fun clickByText(targetText: String, callback: (Boolean) -> Unit) {
+        if (targetText.isBlank()) { callback(false); return }
+        val orderedWindows = windows.sortedBy { if (it.type == AccessibilityWindowInfo.TYPE_APPLICATION) 0 else 1 }
+        for (skipEditable in listOf(true, false)) {
+            for (window in orderedWindows) {
+                for (exact in listOf(true, false)) {
+                    val root = window.root ?: continue
+                    if (root.packageName?.toString() == ownPackageName) {
+                        root.recycle(); continue
+                    }
+                    val node = findTextNode(root, targetText, exact, skipEditable)
+                    root.recycle()
+                    if (node != null) {
+                        val clicked = clickNodeOrParent(node)
+                        val rect = Rect()
+                        node.getBoundsInScreen(rect)
+                        node.recycle()
+                        if (clicked) callback(true)
+                        else if (!rect.isEmpty) dispatchTap(rect.centerX().toFloat(), rect.centerY().toFloat(), callback)
+                        else callback(false)
+                        return
+                    }
+                }
             }
-            // Prefer an actual suggestion/button over an editable search field
-            // that contains the same query. Editables remain the final fallback
-            // so the agent can still focus a search box by its label.
-            val result = findAndClickNode(root, targetText, true, true)
-                || findAndClickNode(root, targetText, false, true)
-                || findAndClickNode(root, targetText, true, false)
-                || findAndClickNode(root, targetText, false, false)
-            root.recycle()
-            if (result) return true
         }
-        return false
+        callback(false)
     }
 
-    private fun findAndClickNode(
-        node: AccessibilityNodeInfo,
-        targetText: String,
-        exactOnly: Boolean,
-        skipEditable: Boolean
-    ): Boolean {
-        val text = node.text?.toString() ?: ""
-        val desc = node.contentDescription?.toString() ?: ""
-
-        val exactMatch = text.equals(targetText, ignoreCase = true)
-            || desc.equals(targetText, ignoreCase = true)
-        val containsMatch = text.contains(targetText, ignoreCase = true)
-            || desc.contains(targetText, ignoreCase = true)
-        val matches = if (exactOnly) exactMatch else containsMatch
-
-        if (matches && (!skipEditable || !node.isEditable) && clickNodeOrParent(node)) {
-            return true
-        }
-
+    private fun findTextNode(node: AccessibilityNodeInfo, target: String, exact: Boolean, skipEditable: Boolean): AccessibilityNodeInfo? {
+        if (!node.isVisibleToUser || (skipEditable && node.isEditable)) return null
+        val labels = listOf(node.text?.toString().orEmpty(), node.contentDescription?.toString().orEmpty())
+        val matches = labels.any { if (exact) it.equals(target, true) else it.contains(target, true) }
+        if (matches && (!skipEditable || !node.isEditable)) return AccessibilityNodeInfo.obtain(node)
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
-            if (findAndClickNode(child, targetText, exactOnly, skipEditable)) {
-                child.recycle()
-                return true
-            }
+            val found = findTextNode(child, target, exact, skipEditable)
             child.recycle()
+            if (found != null) return found
         }
-        return false
+        return null
     }
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
-        var clickTarget: AccessibilityNodeInfo? = node
-        while (clickTarget != null && !clickTarget.isClickable) {
-            clickTarget = clickTarget.parent
+        var target: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+        var originalNode = true
+        while (target != null) {
+            // Virtual controls can implement ACTION_CLICK without isClickable.
+            val clicked = target.isVisibleToUser && target.isEnabled && (originalNode || target.isClickable) &&
+                target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            val parent = if (clicked) null else target.parent
+            target.recycle()
+            if (clicked) return true
+            target = parent
+            originalNode = false
         }
-        if (clickTarget?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true) {
-            return true
-        }
-
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
-        return !rect.isEmpty && clickAtCoordinates(
-            rect.centerX().toFloat(),
-            rect.centerY().toFloat()
-        )
+        return false
     }
 
-    /** Click at specific coordinates using gesture */
-    fun clickAtCoordinates(x: Float, y: Float): Boolean {
-        val path = Path()
-        path.moveTo(x, y)
-        val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0, 100))
-            .build()
-        return dispatchGesture(gesture, null, null)
+    private fun findClickableAt(node: AccessibilityNodeInfo, x: Int, y: Int): AccessibilityNodeInfo? {
+        val bounds = Rect()
+        node.getBoundsInScreen(bounds)
+        if (!node.isVisibleToUser || !bounds.contains(x, y)) return null
+        for (i in node.childCount - 1 downTo 0) {
+            val child = node.getChild(i) ?: continue
+            val found = findClickableAt(child, x, y)
+            child.recycle()
+            if (found != null) return found
+        }
+        return if (node.isClickable && node.isEnabled) AccessibilityNodeInfo.obtain(node) else null
+    }
+
+    fun clickAtCoordinates(x: Float, y: Float, callback: (Boolean) -> Unit) {
+        if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0) { callback(false); return }
+        for (window in windows) {
+            val root = window.root ?: continue
+            if (root.packageName?.toString() == ownPackageName) { root.recycle(); continue }
+            val node = findClickableAt(root, x.toInt(), y.toInt())
+            root.recycle()
+            if (node != null) {
+                val clicked = clickNodeOrParent(node)
+                node.recycle()
+                if (clicked) { callback(true); return }
+                break
+            }
+        }
+        dispatchTap(x, y, callback)
+    }
+
+    private fun dispatchTap(x: Float, y: Float, callback: (Boolean) -> Unit) {
+        val path = Path().apply { moveTo(x, y) }
+        dispatchCompletedGesture(GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 100)).build(), callback)
+    }
+
+    private fun dispatchCompletedGesture(gesture: GestureDescription, callback: (Boolean) -> Unit) {
+        val handler = Handler(Looper.getMainLooper())
+        var finished = false
+        fun finish(success: Boolean) {
+            if (!finished) { finished = true; callback(success) }
+        }
+        val timeout = Runnable { finish(false) }
+        handler.postDelayed(timeout, 2500)
+        try {
+            val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription) {
+                    handler.removeCallbacks(timeout); finish(true)
+                }
+                override fun onCancelled(gestureDescription: GestureDescription) {
+                    handler.removeCallbacks(timeout); finish(false)
+                }
+            }, handler)
+            if (!accepted) { handler.removeCallbacks(timeout); finish(false) }
+        } catch (_: RuntimeException) {
+            handler.removeCallbacks(timeout); finish(false)
+        }
     }
 
     fun typeText(text: String, fieldHint: String? = null): Boolean {
@@ -306,57 +348,51 @@ class AgentAccessibilityService : AccessibilityService() {
         return false
     }
 
-    /** Submit the focused field through the IME, with keyboard-aware fallbacks. */
-    fun pressEnter(): Boolean {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            for (window in windows) {
-                val root = window.root ?: continue
-                if (root.packageName?.toString() == ownPackageName) {
-                    root.recycle()
-                    continue
-                }
-                val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                val submitted = focused?.performAction(
-                    AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
-                ) == true
-                focused?.recycle()
-                root.recycle()
-                if (submitted) return true
-            }
+    /** Submit an editable application field, never a focused letter in the IME. */
+    fun pressEnter(callback: (Boolean) -> Unit) {
+        // On TV the generic Enter action can activate the keyboard's focused
+        // letter instead of submitting the editor. Leave the query intact and
+        // let the agent activate the application's explicit search control.
+        if (packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_LEANBACK) ||
+            packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_TELEVISION)) {
+            callback(false)
+            return
         }
-
-        for (window in windows) {
-            val root = window.root ?: continue
-            val actionNode = findKeyboardActionNode(root)
-            val submitted = actionNode != null && clickNodeOrParent(actionNode)
-            actionNode?.recycle()
-            root.recycle()
-            if (submitted) return true
-        }
-
-        // Tap inside the actual IME window, avoiding the navigation bar.
         for (window in windows) {
             if (window.type != AccessibilityWindowInfo.TYPE_INPUT_METHOD) continue
-            val bounds = Rect()
-            window.getBoundsInScreen(bounds)
-            if (!bounds.isEmpty) {
-                val x = bounds.right - (bounds.width() * 0.10f)
-                val y = bounds.bottom - (bounds.height() * 0.14f)
-                return clickAtCoordinates(x, y)
+            val root = window.root ?: continue
+            val actionNode = findKeyboardActionNode(root)
+            root.recycle()
+            if (actionNode != null) {
+                val submitted = actionNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                actionNode.recycle()
+                if (submitted) { callback(true); return }
             }
         }
-        return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            for (window in windows) {
+                if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                val root = window.root ?: continue
+                if (root.packageName?.toString() == ownPackageName) { root.recycle(); continue }
+                val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                val submitted = focused?.isEditable == true && focused.performAction(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                focused?.recycle()
+                root.recycle()
+                if (submitted) { callback(true); return }
+            }
+        }
+        // A guessed coordinate can press a letter on a TV keyboard. Fail explicitly.
+        callback(false)
     }
 
     private fun findKeyboardActionNode(node: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        if (!node.isVisibleToUser) return null
         val label = (node.text?.toString().orEmpty().ifEmpty {
             node.contentDescription?.toString().orEmpty()
         }).trim().lowercase()
-        val actionLabels = setOf("search", "enter", "go", "done", "send", "next")
-        if (node.isClickable && (label in actionLabels || label.endsWith(" search"))) {
-            return AccessibilityNodeInfo.obtain(node)
-        }
-
+        val labels = setOf("search", "enter", "go", "done", "send", "next", "cerca", "invio", "vai", "fine", "invia", "avanti")
+        if (node.isClickable && node.isEnabled && label in labels) return AccessibilityNodeInfo.obtain(node)
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             val found = findKeyboardActionNode(child)
@@ -462,14 +498,14 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     /** Swipe gesture */
-    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, durationMs: Long = 300): Boolean {
+    fun swipe(startX: Float, startY: Float, endX: Float, endY: Float, callback: (Boolean) -> Unit, durationMs: Long = 300) {
         val path = Path()
         path.moveTo(startX, startY)
         path.lineTo(endX, endY)
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, durationMs))
             .build()
-        return dispatchGesture(gesture, null, null)
+        dispatchCompletedGesture(gesture, callback)
     }
 
     /** Long press at coordinates */

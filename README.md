@@ -2,6 +2,38 @@
 
 PrivateAgent is an open-source Android automation agent built with Flutter. It utilizes the DeepSeek API and native Android Accessibility Services to interpret screen layouts and execute multi-step tasks across any installed application via natural language commands.
 
+
+## Android TV work in this fork
+
+The `codex/android-tv-controls` branch adds experimental TV control fixes:
+accessible controls are activated before touch gestures; gestures report their
+completion or cancellation; generic Enter is rejected on TV to prevent focused-letter insertion; searches use explicit application submit controls;
+application results take priority over keyboard suggestions. Failed, cancelled,
+and step-limited tasks remain failures in the chat, and unchanged screens stop
+repeated actions. Saved actions require fresh screen verification.
+
+The tested configuration uses the Custom provider, base URL
+`https://api.openai.com/v1`, model `gpt-6.1-terra`, and a 4096-token response limit.
+The Terra payload adaptation is restricted to that exact provider/model pair.
+Configure credentials in the app. These control fixes use the existing
+accessibility service and do not require Shizuku or root.
+
+Build and unit-test with Flutter 3.47.9:
+
+```sh
+flutter test
+flutter build apk --release --target-platform android-arm
+```
+
+Real-device tests live in `android/app/src/androidTest`. Build their target/test
+APK pair with `-PnativeControlTests=true` to avoid cross-APK R8 class optimizations.
+The instrumentation emits `stage=waiting_for_accessibility`: after its process
+restart, rebind the already-enabled PrivateAgent service while preserving other
+accessibility services. Normal release builds remain optimized. Full task results
+must be checked on the destination screen; acceptance of an Android action alone
+is insufficient. Voice input and compatibility with other TV models require
+separate validation.
+
 ## Architecture
 
 The system operates on a continuous feedback loop:

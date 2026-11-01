@@ -182,9 +182,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   ? (action.response.isNotEmpty
                         ? action.response
                         : (result.details ?? 'Done.'))
-                  : (action.response.isNotEmpty
-                        ? '${action.response}\n\n⚠️ ${result.details}'
-                        : '⚠️ ${result.details}'),
+                  : '⚠️ ${result.details ?? 'Task could not be completed.'}',
               actionResult: result,
             ),
           );

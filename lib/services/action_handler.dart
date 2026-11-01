@@ -11,6 +11,12 @@ import 'task_executor.dart';
 import 'ai_service.dart';
 
 class ActionHandler {
+  final TaskExecutor Function(AiService, void Function(String)?)?
+  _createTaskExecutor;
+  ActionHandler({
+    TaskExecutor Function(AiService, void Function(String)?)?
+    createTaskExecutor,
+  }) : _createTaskExecutor = createTaskExecutor;
   final AppLauncherService _appLauncher = AppLauncherService();
   final ContactsService _contacts = ContactsService();
   final CommunicationService _communication = CommunicationService();
@@ -123,13 +129,18 @@ class ActionHandler {
         case 'click_element':
           final text = action.params['text'] as String? ?? '';
           final success = await _screenAutomation.clickByText(text);
-          result = success ? 'Clicked "$text"' : 'Could not find "$text" to click';
+          result = success
+              ? 'Clicked "$text"'
+              : 'Could not find "$text" to click';
           break;
 
         case 'type_on_screen':
           final text = action.params['text'] as String? ?? '';
           final hint = action.params['field_hint'] as String?;
-          final success = await _screenAutomation.typeText(text, fieldHint: hint);
+          final success = await _screenAutomation.typeText(
+            text,
+            fieldHint: hint,
+          );
           result = success ? 'Typed "$text"' : 'Could not type into field';
           break;
 
@@ -149,19 +160,31 @@ class ActionHandler {
         case 'execute_task':
           final goal = action.params['goal'] as String? ?? action.response;
           if (aiService == null) {
-            result = 'AI service not available for task execution.';
-            break;
+            return AgentActionResult(
+              actionType: action.action,
+              success: false,
+              details: 'AI service not available for task execution.',
+            );
           }
-          _currentExecutor = TaskExecutor(
-            aiService: aiService,
-            screenService: _screenAutomation,
-            appLauncher: _appLauncher,
-            shizukuService: _shizuku,
-            onProgress: onProgress,
-          );
-          result = await _currentExecutor!.executeTask(goal);
-          _currentExecutor = null;
-          break;
+          _currentExecutor =
+              _createTaskExecutor?.call(aiService, onProgress) ??
+              TaskExecutor(
+                aiService: aiService,
+                screenService: _screenAutomation,
+                appLauncher: _appLauncher,
+                shizukuService: _shizuku,
+                onProgress: onProgress,
+              );
+          try {
+            final outcome = await _currentExecutor!.executeTask(goal);
+            return AgentActionResult(
+              actionType: action.action,
+              success: outcome.success,
+              details: outcome.message,
+            );
+          } finally {
+            _currentExecutor = null;
+          }
 
         default:
           result = action.response;
