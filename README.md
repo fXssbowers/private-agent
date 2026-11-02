@@ -87,6 +87,26 @@ not claim success. Valid text grounding is not an independent semantic goal orac
 The original user request remains authoritative over a model's working restatement;
 unrequested quality improvements must not prolong a completed task.
 
+`review_strategy` is a task-local, read-only assessment, separate from persistent
+app memory. A checkpoint is requested after eight ordinary decisions, three text
+attempts, an observed cycle or exhausted local repair. These engineering thresholds
+signal a need to assess progress, not proof that a route is wrong. Changing query,
+UI layout or a plan name does not reset the checkpoint. The same configured model
+reviews the original request, recent outcomes and the current screen within the
+existing task budget. It may continue on fresh grounded evidence, give an observed
+interaction problem two repair decisions, switch to a complete alternative plan,
+or stop unresolved. Reusing the same evidence cannot repeatedly renew continuation.
+While review is required, other UI actions are blocked; two invalid review decisions
+stop without further navigation. Completion verification takes precedence.
+
+Plan proposals now report acceptance or rejection; an implicit strategy change is
+not silently discarded. Ordinary explicit replans do not reset the review budget.
+The model still judges semantic progress and whether alternatives differ meaningfully:
+exact evidence and bounded retries are not an independent semantic verifier.
+Review itself writes no memory lesson or successful route. Existing observation
+learning and completion-gated navigation prefixes retain their quotas and provenance.
+No application-specific navigation route or automatic HD/FPS preference is added.
+
 A rejected/ineffective control now requests local interaction repair while retaining
 the strategy/subgoal; repeated closed cycles still permit strategy replanning.
 Early replanning is deferred while local recovery remains (up to three distinct

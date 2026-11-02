@@ -20,6 +20,9 @@ class TaskProgressGuard {
   bool get needsLocalRepair => _localRepair;
   int get localFailures => _failedControls.length;
   int get planRevision => _planRevision;
+  String? get activeStrategy => _plan['strategy'];
+  bool get repairExhausted =>
+      _localRepair && (_failedControls.length >= 3 || _repairDecisions >= 8);
   bool get deferStrategyChange =>
       !_needsReplan &&
       _localRepair &&
@@ -173,20 +176,21 @@ class TaskProgressGuard {
 
   /// The model may update its subgoal within a strategy; switching a strategy
   /// requires abandoning it explicitly or an observed need to replan.
-  void adoptPlan(dynamic value) {
-    if (value is! Map) return;
+  String adoptPlan(dynamic value) {
+    if (value is! Map) return 'plan_absent';
     String short(dynamic text) => text is String
         ? text.trim().substring(0, text.trim().length.clamp(0, 180))
         : '';
     final strategy = short(value['strategy']);
-    if (strategy.isEmpty) return;
+    if (strategy.isEmpty) return 'plan_invalid';
     if (_plan.isNotEmpty && strategy != _plan['strategy'] && !_needsReplan) {
-      return;
+      return 'plan_review_required';
     }
     if (_plan.isNotEmpty && strategy != _plan['strategy']) {
       abandon('Observed approach did not make useful progress.');
     }
-    if (_plan['strategy'] != strategy) _planRevision++;
+    final changedStrategy = _plan['strategy'] != strategy;
+    if (changedStrategy) _planRevision++;
     _plan = {
       'strategy': strategy,
       'subgoal': short(value['subgoal']),
@@ -206,7 +210,10 @@ class TaskProgressGuard {
       }
     }
     _alternatives.remove(strategy);
-    _needsReplan = false;
+    // Only an explicit replan/review may clear an observed cycle. Repeating the
+    // current plan alongside an ordinary action is not a recovery decision.
+    if (changedStrategy) _needsReplan = false;
+    return 'plan_accepted';
   }
 
   void abandon(String reason) {
@@ -228,6 +235,7 @@ class TaskProgressGuard {
   void selectAlternative(String reason) {
     abandon(reason);
     if (_alternatives.isNotEmpty) {
+      _planRevision++;
       _plan = {
         'strategy': _alternatives.removeAt(0),
         'subgoal': 'Find a useful route from the actual current screen',

@@ -15,6 +15,7 @@ import 'task_progress_guard.dart';
 import 'diagnostic_trace_service.dart';
 import '../models/ui_interaction_result.dart';
 import 'completion_verification.dart';
+import 'strategy_review.dart';
 
 /// Executes multi-step UI automation tasks using LLM-guided screen reading.
 ///
@@ -86,6 +87,7 @@ Available actions:
 - open_app: {"app_name": "WhatsApp"} - Open an app
 - wait: {} - Wait a moment for content to load
 - replan: {} - Abandon a stalled strategy; choose an alternative. This does not move the UI.
+- review_strategy: {"outcome":"continue|repair|switch|stop", "assessment":"what the observations establish", "evidence":["exact current text"]} - Read-only assessment of progress. For switch include a top-level plan with strategy, subgoal and expected_observation.
 - done: {} - Task is complete and the current screen confirms the requested result
 - failed: {} - Task cannot be completed; explain the obstacle
 - continue_task: {"missing_condition": "precise unmet requirement or observation needed"} - Only during completion verification: explicitly resume an unfinished task; this performs no UI action
@@ -97,13 +99,15 @@ Rules:
 - If you need to click something, prefer using `click_text`. If the element does not have text, use `click_at` with the coordinates provided in the text dump.
 - type_text already focuses the editable control before setting text. If an editable field is visible, type_text directly; do not click a search/microphone icon first merely to show the keyboard. A voice-related hint in an editable field still permits TEXT input.
 - Voice controls marked [voice] are not text search controls. Do not activate voice recognition unless the ORIGINAL user explicitly requested app voice input. If the app starts voice automatically on entering search, dismiss an active recognizer dialog with one press_back and observe before focusing/typing into the editable field; do not abandon text search just because voice started.
-- A wrong control, rejected action or query that did not stick is an INTERACTION failure, not proof the strategy is wrong. Retain the strategy/subgoal and try another appropriate control/input method in the same search flow. Use strategy replanning only after distinct local attempts are exhausted or a repeated closed cycle is observed. The executor already waits after each action; wait only for visible loading.
+- A wrong control, rejected action or query that did not stick is an INTERACTION failure, not proof the strategy is wrong. Retain the strategy/subgoal and try another appropriate control/input method in the same search flow. Use strategy review when repeated attempts bring no useful goal-relevant evidence, local repair is exhausted, or a closed cycle is observed. The executor already waits after each action; wait only for visible loading.
+- A correctly entered query with unhelpful results is different from a typing failure. Changing queries is a variant of the same search approach. Judge progress by newly observed facts relevant to the original goal, not by accepted actions or novel layouts. When exploration stops producing useful information, use review_strategy to assess a genuinely different approach, including other observed navigation routes.
+- Keep the strategy name stable during execution. A changed plan field is only a proposal; the controller reports whether it adopted it. Use explicit replan or review_strategy to switch. A required review takes priority over local-repair advice and performs no UI actions. Review decisions count within the task limit.
 - After typing a search query, use press_enter at most once. It is unsupported on Android TV because it can type the focused keyboard letter. If rejected, keep the query and activate the application's explicit search/submit control: look for a clickable Button inside or next to the editable field, even if it has no text. Do not retry Enter or press a letter key. Dismiss the keyboard with press_back only if it is visibly open.
 - Continue a useful navigation sequence across different observed states, including repeated use of the same navigation key. Change route when observations show a cycle or repeated rejection. Consider global navigation actions as well as visible app controls.
 - completion_evidence is a top-level string or array of 1–4 strings for done, separate from reasoning and params. Copy exact CURRENT visible text, 3–512 characters per fragment. Put separate labels in separate strings instead of joining them into a sentence. A formatting repair does not require changing the successful navigation route.
 - The ORIGINAL USER REQUEST defines completion. The working goal is only a restatement: do not add requirements or continue optimizing quality/preferences that the user did not ask for. Once the requested result is reached, verify it and stop.
 - Use done ONLY after reading a subsequent screen that confirms the FULL requested result, including its requested mode (for example a live player rather than a listing or guide). Include completion_evidence copied exactly from that screen; omit done when evidence is insufficient. An accepted click or opened app does not prove the full task succeeded.
-- Never type letters through the keyboard to submit. Use press_enter; if it fails, choose a visible search button or report failed.
+- Never type letters through the keyboard to submit. On Android TV prefer an explicit visible application search/submit control; respect the unsupported Enter feedback.
 - If you need to find something by scrolling, scroll and then check the screen again.
 - If the requested app cannot be opened, report failed rather than opening an unrelated app.
 - Start with a compact plan: strategy, subgoal, expected_observation and two or three alternative approaches. Keep the strategy/subgoal across multiple actions while gathering useful observations. Do not abandon a navigation approach after only one step if the UI has changed and further navigation can reveal relevant controls.
@@ -207,6 +211,7 @@ Rules:
     String lastAction = '';
     final progressGuard = TaskProgressGuard();
     final verification = CompletionVerification();
+    final strategyReview = StrategyReview();
     final memory = TaskMemorySession(_appMemory);
     final directTouchAvailable = await _screenService.canDispatchTouch();
     int consecutiveFailures = 0;
@@ -214,6 +219,7 @@ Rules:
     int totalTokens = 0;
     String? expectedTypedValue;
     String? expectedTypedControl;
+    String planFeedback = '';
 
     if (shortcut != null && shortcut.isNotEmpty) {
       results.add('Using navigation shortcut: ${shortcut.length} steps');
@@ -334,6 +340,17 @@ Rules:
           }
         }
       }
+      strategyReview.observe(
+        cycle: progressGuard.needsReplan,
+        repairExhausted: progressGuard.repairExhausted,
+      );
+      if (strategyReview.required && !verification.active) {
+        await diagnostic.event('strategy_checkpoint', {
+          'step': step + 1,
+          'reason': strategyReview.reason,
+          'strategy_decisions': strategyReview.decisions,
+        });
+      }
       await diagnostic.event('observation', {
         'step': step + 1,
         'screen': progressGuard.currentState,
@@ -375,6 +392,8 @@ TASK (working restatement): $userGoal
 
 DEVICE DIRECT TOUCH: ${directTouchAvailable ? "available; TV keyboard must still be closed" : "UNAVAILABLE on this display. Do not propose tap_at or gesture-only recovery; use accessible controls and global navigation."}
 ${verification.prompt}
+${verification.active ? '' : strategyReview.prompt}
+$planFeedback
 CURRENT SCREEN TEXT DUMP:
 $screenContent$prevResultStr$failureHint
 ${progressGuard.context}
@@ -388,7 +407,13 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       final modelTimer = Stopwatch()..start();
       try {
         _cancelCompleter = Completer<void>();
-        final aiFuture = _aiService.sendTaskMessage(_taskSystemPrompt, prompt);
+        final aiFuture = _aiService.sendTaskMessage(
+          _taskSystemPrompt +
+              (strategyReview.required && !verification.active
+                  ? '\nFor this decision you are the read-only strategy reviewer. Assess the evidence before proposing more UI interaction. Return review_strategy, grounded done, or failed only.'
+                  : ''),
+          prompt,
+        );
 
         // Race: whichever finishes first wins
         final result = await Future.any([
@@ -642,12 +667,75 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         );
         continue;
       }
-      if (action == 'continue_task') {
+      if (action == 'continue_task' && !strategyReview.required) {
+        strategyReview.recordDecision(action);
         results.add(
           'continue_task is only available during completion verification; observe and choose the next ordinary task action.',
         );
         continue;
       }
+      if (action == 'review_strategy' ||
+          (strategyReview.required && action == 'failed')) {
+        final reviewParams = action == 'failed'
+            ? <String, dynamic>{'outcome': 'stop', 'assessment': reasoning}
+            : params;
+        final rejection = strategyReview.assess(
+          reviewParams,
+          screen: screenContent,
+          activeStrategy: progressGuard.activeStrategy,
+          plan: actionJson['plan'],
+          localRepair: progressGuard.needsLocalRepair,
+        );
+        await diagnostic.event('strategy_review', {
+          'step': step + 1,
+          'accepted': rejection == null,
+          'reason': rejection ?? 'review_${reviewParams['outcome']}',
+        });
+        if (rejection != null) {
+          results.add(
+            'Strategy review rejected: $rejection. No UI action ran. Correct the assessment using current observations.',
+          );
+          if (strategyReview.exhausted) {
+            return _stopStrategyReview(
+              userGoal,
+              totalTokens,
+              step + 1,
+              results,
+            );
+          }
+          continue;
+        }
+        final outcome = reviewParams['outcome'];
+        if (outcome == 'stop') {
+          return _stopStrategyReview(userGoal, totalTokens, step + 1, results);
+        }
+        if (outcome == 'switch') {
+          progressGuard.abandon(reviewParams['assessment'] as String);
+          progressGuard.adoptPlan(actionJson['plan']);
+        }
+        planFeedback = '';
+        results.add(
+          'Strategy review accepted ($outcome): ${reviewParams['assessment']}. No UI action ran; continue from the actual current screen.',
+        );
+        _report('Strategy review: $outcome. ${reviewParams['assessment']}');
+        continue;
+      }
+      if (strategyReview.required && action != 'done') {
+        strategyReview.reject();
+        await diagnostic.event('strategy_review_blocked', {
+          'step': step + 1,
+          'action': action,
+          'reason': strategyReview.reason,
+        });
+        results.add(
+          'Read-only strategy review required. The proposed action was NOT dispatched. Use review_strategy to assess progress, repair, switch or stop.',
+        );
+        if (strategyReview.exhausted) {
+          return _stopStrategyReview(userGoal, totalTokens, step + 1, results);
+        }
+        continue;
+      }
+      strategyReview.recordDecision(action);
       if ((action == 'replan' || action == 'failed') &&
           progressGuard.deferStrategyChange) {
         results.add(
@@ -661,6 +749,19 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         continue;
       }
       if (action == 'replan') {
+        final plan = actionJson['plan'];
+        if (plan is! Map ||
+            plan['strategy'] is! String ||
+            (plan['strategy'] as String).trim().isEmpty) {
+          results.add(
+            'Replan rejected: supply a top-level plan with a strategy. The current plan was preserved.',
+          );
+          await diagnostic.event('plan_proposal', {
+            'step': step + 1,
+            'reason': 'plan_invalid',
+          });
+          continue;
+        }
         await diagnostic.event('plan_change', {
           'step': step + 1,
           'reason': 'model_replan',
@@ -668,11 +769,22 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         });
         progressGuard.abandon(reasoning);
         progressGuard.adoptPlan(actionJson['plan']);
+        planFeedback = '';
         results.add('Replanning from the actual current screen: $reasoning');
         _report('Trying another strategy: $reasoning');
         continue;
       }
-      progressGuard.adoptPlan(actionJson['plan']);
+      final planStatus = progressGuard.adoptPlan(actionJson['plan']);
+      planFeedback = planStatus == 'plan_review_required'
+          ? 'PLAN PROPOSAL NOT ADOPTED: the active strategy remains ${progressGuard.activeStrategy}. Use explicit replan or review_strategy to change the approach; changing the plan field alone does not switch it.'
+          : '';
+      if (actionJson['plan'] != null) {
+        await diagnostic.event('plan_proposal', {
+          'step': step + 1,
+          'reason': planStatus,
+          'plan_revision': progressGuard.planRevision,
+        });
+      }
       if (action == 'failed' && progressGuard.hasAlternatives) {
         progressGuard.selectAlternative(reasoning);
         results.add(
@@ -969,6 +1081,26 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       TaskStatus.failed,
       'I could not complete the task within the allowed steps.',
     );
+  }
+
+  Future<TaskResult> _stopStrategyReview(
+    String goal,
+    int tokens,
+    int steps,
+    List<String> results,
+  ) async {
+    const message =
+        'I stopped without further navigation because I could not establish a reliable next approach. The task remains unresolved; this does not prove the requested result is unavailable.';
+    _report(message);
+    await TaskHistoryLogger.logTask(goal, 'Failed', tokens, steps, [
+      ...results,
+      message,
+    ]);
+    await _notificationService.showTaskCompleteNotification(
+      'Task unresolved',
+      message,
+    );
+    return const TaskResult(TaskStatus.failed, message);
   }
 
   Future<TaskResult> _stopUnverified(

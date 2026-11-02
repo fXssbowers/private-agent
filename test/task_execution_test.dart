@@ -162,6 +162,15 @@ class ChangingObservation extends Screen {
       reads++ == 0 ? 'Requested detail visible' : 'A different screen';
 }
 
+class ReviewInput extends RecoverableInput {
+  @override
+  Future<bool> pressBack() async {
+    backs++;
+    typed = 'Requested detail';
+    return true;
+  }
+}
+
 class VoicePolicyScreen extends Screen {
   bool? allowed;
   @override
@@ -194,12 +203,15 @@ class Model extends AiService {
   Completer<AiResponse>? pending;
   Completer<AiResponse>? retryPending;
   Object? secondError;
+  int? pauseAt;
+  Completer<AiResponse>? reviewPending;
   @override
   int get maxSteps => limit;
   @override
   Future<AiResponse> sendTaskMessage(String system, String prompt) {
     calls++;
     prompts.add(prompt);
+    if (calls == pauseAt) return reviewPending!.future;
     if (calls == 2 && secondError != null) return Future.error(secondError!);
     if (calls > 1 && retryPending != null) return retryPending!.future;
     return pending?.future ??
@@ -244,6 +256,151 @@ void main() {
   tearDown(() async {
     await directory.delete(recursive: true);
   });
+
+  test('continue_task cannot bypass a required strategy review', () async {
+    final ai = Model([
+      for (final query in ['first', 'second', 'third'])
+        '{"action":"type_text","params":{"text":"$query"}}',
+      '{"action":"continue_task","params":{"missing_condition":"find a target"}}',
+      '{"action":"continue_task","params":{"missing_condition":"find a target"}}',
+    ]);
+    final screen = ReviewInput();
+    final result = await executor(ai, screen).executeTask('Inspect the target');
+    expect(result.success, false);
+    expect(result.message, contains('reliable next approach'));
+    expect(ai.calls, 5);
+    expect(screen.backs, 0);
+    expect(screen.clicks, 0);
+  });
+
+  test(
+    'Stop while a strategy review is pending prevents further interaction',
+    () async {
+      final ai =
+          Model([
+              for (final query in ['first', 'second', 'third'])
+                '{"action":"type_text","params":{"text":"$query"}}',
+            ])
+            ..pauseAt = 4
+            ..reviewPending = Completer<AiResponse>();
+      final screen = ReviewInput();
+      final runner = executor(ai, screen);
+      final future = runner.executeTask('Inspect the requested detail');
+      final deadline = DateTime.now().add(const Duration(seconds: 15));
+      while (ai.calls < 4 && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      expect(ai.calls, 4);
+      runner.cancel();
+      expect((await future).status, TaskStatus.cancelled);
+      ai.reviewPending!.complete(AiResponse('{"action":"press_back"}', 10));
+      expect(screen.backs, 0);
+      expect(screen.clicks, 0);
+    },
+  );
+
+  test(
+    'query variants force read-only review before a new route can run',
+    () async {
+      final ai = Model([
+        for (final query in ['first', 'second', 'third'])
+          '{"action":"type_text","params":{"text":"$query"}}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"review_strategy","params":{"outcome":"switch","assessment":"Search did not locate the target; inspect navigation instead","evidence":"third"},"plan":{"strategy":"inspect navigation","subgoal":"locate another route","expected_observation":"navigation controls"}}',
+        '{"action":"press_back"}',
+        '{"action":"done","completion_evidence":"Requested detail"}',
+      ]);
+      final screen = ReviewInput();
+      expect(
+        (await executor(
+          ai,
+          screen,
+        ).executeTask('Inspect the requested detail')).success,
+        true,
+      );
+      expect(screen.clicks, 0);
+      expect(screen.backs, 1);
+      expect(ai.prompts[3], contains('REQUIRED — read-only'));
+      expect(ai.prompts[5], contains('"strategy":"inspect navigation"'));
+    },
+  );
+
+  test(
+    'ignored strategy review stops with no further UI or successful memory',
+    () async {
+      final ai = Model([
+        for (final query in ['first', 'second', 'third'])
+          '{"action":"type_text","params":{"text":"$query"}}',
+        '{"action":"press_back"}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+      ]);
+      final screen = ReviewInput();
+      final store = AppMemoryService(
+        directory: Directory('${directory.path}/notes'),
+      );
+      final runner = TaskExecutor(
+        aiService: ai,
+        screenService: screen,
+        appLauncher: AppLauncherService(),
+        shizukuService: ShizukuService(),
+        notificationService: Notices(),
+        appMemoryService: store,
+      );
+      final result = await runner.executeTask('Inspect an absent result');
+      expect(result.success, false);
+      expect(result.message, contains('does not prove'));
+      expect(screen.backs, 0);
+      expect(screen.clicks, 0);
+      final doc = await store.inspectApp('fixture.app');
+      expect(
+        (doc?['lessons'] as List? ?? []).where(
+          (l) => l['source'] == 'observed_route',
+        ),
+        isEmpty,
+      );
+    },
+  );
+
+  test(
+    'completion verification takes priority over a due strategy review',
+    () async {
+      final ai = Model([
+        for (final query in ['first', 'second', 'third'])
+          '{"action":"type_text","params":{"text":"$query"}}',
+        '{"action":"done","completion_evidence":"invented"}',
+        '{"action":"review_strategy","params":{"outcome":"stop","assessment":"Cannot verify"}}',
+        '{"action":"done","completion_evidence":"third"}',
+      ]);
+      final screen = ReviewInput();
+      expect(
+        (await executor(
+          ai,
+          screen,
+        ).executeTask('Inspect the final input')).success,
+        true,
+      );
+      expect(ai.prompts[4], contains('COMPLETION VERIFICATION PENDING'));
+      expect(ai.prompts[4], isNot(contains('STRATEGY REVIEW:')));
+      expect(screen.backs, 0);
+    },
+  );
+
+  test(
+    'implicit strategy change returns actionable feedback instead of disappearing',
+    () async {
+      final ai = Model([
+        '{"action":"press_back","plan":{"strategy":"first route"}}',
+        '{"action":"press_back","plan":{"strategy":"different route"}}',
+        '{"action":"done","completion_evidence":"Interstellar 2014"}',
+      ]);
+      expect(
+        (await executor(ai, Screen()).executeTask('Inspect detail')).success,
+        true,
+      );
+      expect(ai.prompts.last, contains('PLAN PROPOSAL NOT ADOPTED'));
+      expect(ai.prompts.last, contains('explicit replan or review_strategy'));
+    },
+  );
 
   test('a two-screen cycle requires a different action on return', () {
     final guard = TaskProgressGuard();
@@ -437,25 +594,23 @@ void main() {
       expect(ai.prompts[3], contains('"dispatched":false'));
     },
   );
-  test(
-    'an alternative route remains executable after a detected cycle',
-    () async {
-      final ai = Model([
-        ...List.filled(5, '{"action":"click_at","params":{"x":10,"y":50}}'),
-        '{"action":"click_at","params":{"x":20,"y":50}}',
-        '{"action":"done","reasoning":"Requested search result visible","completion_evidence":"requested search result"}',
-      ]);
-      final screen = CyclingScreen();
-      final result = await executor(ai, screen).executeTask('search');
-      expect(result.status, TaskStatus.succeeded);
-      expect(screen.routeClicks, 4);
-      expect(screen.searchClicks, 1);
-      expect(screen.state, 'requested search result');
-      expect(ai.prompts[4], contains('STRATEGY CHANGE REQUIRED'));
-      expect(ai.prompts[5], contains('"dispatched":false'));
-      expect(ai.prompts.last, contains('requested search result'));
-    },
-  );
+  test('an alternative route remains executable after a detected cycle', () async {
+    final ai = Model([
+      ...List.filled(5, '{"action":"click_at","params":{"x":10,"y":50}}'),
+      '{"action":"review_strategy","params":{"outcome":"switch","assessment":"The guide route cycles; use another visible control","evidence":"player"},"plan":{"strategy":"alternate controls","subgoal":"find requested result","expected_observation":"requested result visible"}}',
+      '{"action":"click_at","params":{"x":20,"y":50}}',
+      '{"action":"done","reasoning":"Requested search result visible","completion_evidence":"requested search result"}',
+    ]);
+    final screen = CyclingScreen();
+    final result = await executor(ai, screen).executeTask('search');
+    expect(result.status, TaskStatus.succeeded);
+    expect(screen.routeClicks, 4);
+    expect(screen.searchClicks, 1);
+    expect(screen.state, 'requested search result');
+    expect(ai.prompts[4], contains('STRATEGY CHANGE REQUIRED'));
+    expect(ai.prompts[5], contains('NOT dispatched'));
+    expect(ai.prompts.last, contains('requested search result'));
+  });
   test(
     'a fresh executor receives a prior failed navigation lesson without replay',
     () async {
