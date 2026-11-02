@@ -14,6 +14,7 @@ import 'package:private_agent/services/shizuku_service.dart';
 import 'package:private_agent/services/task_executor.dart';
 import 'package:private_agent/services/task_progress_guard.dart';
 import 'package:private_agent/services/app_memory_service.dart';
+import 'package:private_agent/services/task_history_logger.dart';
 
 class Screen extends ScreenAutomationService {
   bool running = true;
@@ -154,6 +155,13 @@ class RecoverableInput extends Screen {
   }
 }
 
+class ChangingObservation extends Screen {
+  int reads = 0;
+  @override
+  Future<String> getCompressedScreenDescription(String task) async =>
+      reads++ == 0 ? 'Requested detail visible' : 'A different screen';
+}
+
 class VoicePolicyScreen extends Screen {
   bool? allowed;
   @override
@@ -185,12 +193,14 @@ class Model extends AiService {
   final prompts = <String>[];
   Completer<AiResponse>? pending;
   Completer<AiResponse>? retryPending;
+  Object? secondError;
   @override
   int get maxSteps => limit;
   @override
   Future<AiResponse> sendTaskMessage(String system, String prompt) {
     calls++;
     prompts.add(prompt);
+    if (calls == 2 && secondError != null) return Future.error(secondError!);
     if (calls > 1 && retryPending != null) return retryPending!.future;
     return pending?.future ??
         Future.value(AiResponse(responses.removeAt(0), 10));
@@ -599,6 +609,202 @@ void main() {
       guard.recordAttempt('press_back', {}, true, 'Accepted');
     }
   });
+  test(
+    'a rejected done blocks an unwanted click before repairing the evidence',
+    () async {
+      final ai = Model([
+        '{"action":"done","completion_evidence":"Interstellar 2014 is playing"}',
+        '{"action":"click_at","params":{"x":50,"y":50},"plan":{"strategy":"start another search"}}',
+        '{"action":"done","completion_evidence":"Interstellar 2014","reasoning":"Requested detail visible"}',
+      ]);
+      final screen = Screen();
+      final result = await executor(
+        ai,
+        screen,
+      ).executeTask('Inspect film detail');
+      expect(result.success, true);
+      expect(screen.clicks, 0);
+      expect(screen.backs, 0);
+      expect(ai.prompts[1], contains('COMPLETION VERIFICATION PENDING'));
+      expect(ai.prompts.last, contains('was not dispatched'));
+    },
+  );
+  test(
+    'two ignored verification requests stop on the reached screen without false success',
+    () async {
+      final ai = Model([
+        '{"action":"done"}',
+        '{"action":"press_back"}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+      ]);
+      final screen = Screen();
+      final result = await executor(
+        ai,
+        screen,
+      ).executeTask('Inspect film detail');
+      expect(result.success, false);
+      expect(result.message, contains('completion could not be verified'));
+      expect(ai.calls, 3);
+      expect(screen.backs, 0);
+      expect(screen.clicks, 0);
+    },
+  );
+  test(
+    'verification re-reads the current screen and cannot accept stale evidence',
+    () async {
+      final ai = Model([
+        '{"action":"done","completion_evidence":"wrong quote"}',
+        '{"action":"done","completion_evidence":"Requested detail visible"}',
+        '{"action":"done","completion_evidence":["Requested detail visible"]}',
+      ]);
+      final screen = ChangingObservation();
+      expect(
+        (await executor(ai, screen).executeTask('Inspect detail')).success,
+        false,
+      );
+      expect(screen.reads, 3);
+      expect(screen.clicks, 0);
+    },
+  );
+  test(
+    'an explicit missing condition allows further work after verification',
+    () async {
+      final ai = Model([
+        '{"action":"done","completion_evidence":"not visible"}',
+        '{"action":"continue_task","params":{"missing_condition":"Open the requested detail view"}}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"done","completion_evidence":"Interstellar 2014"}',
+      ]);
+      final screen = Screen();
+      expect(
+        (await executor(ai, screen).executeTask('Inspect detail')).success,
+        true,
+      );
+      expect(screen.clicks, 1);
+      expect(ai.prompts[2], isNot(contains('COMPLETION VERIFICATION PENDING')));
+      expect(ai.prompts[2], contains('Open the requested detail view'));
+    },
+  );
+  test(
+    'an empty missing condition cannot release the verification barrier',
+    () async {
+      final ai = Model([
+        '{"action":"done"}',
+        '{"action":"continue_task","params":{"missing_condition":""}}',
+        '{"action":"press_back"}',
+      ]);
+      final screen = Screen();
+      expect(
+        (await executor(ai, screen).executeTask('Inspect detail')).success,
+        false,
+      );
+      expect(screen.backs, 0);
+      expect(ai.prompts.last, contains('COMPLETION VERIFICATION PENDING'));
+    },
+  );
+  test(
+    'the original request accompanies a more demanding model restatement',
+    () async {
+      final ai = Model([
+        '{"action":"done","completion_evidence":"Interstellar 2014"}',
+      ]);
+      await executor(ai, Screen()).executeTask(
+        'Inspect the highest quality edition',
+        trustedUserRequest: 'Open Interstellar 2014 detail',
+      );
+      expect(
+        ai.prompts.single,
+        contains('ORIGINAL USER REQUEST: Open Interstellar 2014 detail'),
+      );
+      expect(
+        ai.prompts.single,
+        contains(
+          'TASK (working restatement): Inspect the highest quality edition',
+        ),
+      );
+    },
+  );
+  test(
+    'Stop remains effective while waiting for a completion repair',
+    () async {
+      final ai = Model(['{"action":"done"}'])
+        ..retryPending = Completer<AiResponse>();
+      final screen = Screen();
+      final runner = executor(ai, screen);
+      final future = runner.executeTask('Inspect detail');
+      while (ai.calls < 2) {
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+      }
+      runner.cancel();
+      expect((await future).status, TaskStatus.cancelled);
+      ai.retryPending!.complete(
+        AiResponse(
+          '{"action":"done","completion_evidence":"Interstellar 2014"}',
+          10,
+        ),
+      );
+      expect(screen.clicks, 0);
+      expect(screen.backs, 0);
+    },
+  );
+  test(
+    'an AI error during verification records an unverified result and diagnostic cause',
+    () async {
+      final events = <Map<dynamic, dynamic>>[];
+      const channel = MethodChannel('com.privateagent/accessibility');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'diagnosticState') return {'enabled': true};
+            if (call.method == 'diagnosticEvent')
+              events.add(Map.from(call.arguments));
+            return null;
+          });
+      try {
+        final ai = Model(['{"action":"done"}'])
+          ..secondError = TimeoutException('test timeout');
+        final screen = Screen();
+        final result = await executor(ai, screen).executeTask('Inspect detail');
+        expect(result.success, false);
+        expect(result.message, contains('completion could not be verified'));
+        expect(
+          (await TaskHistoryLogger.readHistory()).single['status'],
+          'Unverified',
+        );
+        expect(
+          events.singleWhere(
+            (e) => e['event'] == 'verification_unresolved',
+          )['fields']['reason'],
+          'timeout',
+        );
+        expect(screen.clicks, 0);
+        expect(screen.backs, 0);
+      } finally {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, null);
+      }
+    },
+  );
+  test(
+    'invalid JSON or invalid decision fields during verification stay unverified',
+    () async {
+      for (final invalid in ['not JSON', '{"action":"click_at","params":[]}']) {
+        final ai = Model(['{"action":"done"}', invalid, invalid]);
+        final screen = Screen();
+        final result = await executor(ai, screen).executeTask('Inspect detail');
+        expect(result.success, false);
+        expect(result.message, contains('completion could not be verified'));
+        expect(
+          (await TaskHistoryLogger.readHistory()).every(
+            (r) => r['status'] == 'Unverified',
+          ),
+          true,
+        );
+        expect(screen.clicks, 0);
+        expect(screen.backs, 0);
+        expect(ai.calls, 3);
+      }
+    },
+  );
   test('shared corridors and actual backtracking allow three new branches', () {
     final guard = TaskProgressGuard()..observe('A');
     void move(String action, String next) {

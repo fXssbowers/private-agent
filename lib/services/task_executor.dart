@@ -14,6 +14,7 @@ import '../models/task_result.dart';
 import 'task_progress_guard.dart';
 import 'diagnostic_trace_service.dart';
 import '../models/ui_interaction_result.dart';
+import 'completion_verification.dart';
 
 /// Executes multi-step UI automation tasks using LLM-guided screen reading.
 ///
@@ -68,7 +69,7 @@ Respond with ONLY a JSON object (no markdown, no code fences):
   "params": {"key": "value"},
   "reasoning": "why you chose this action",
   "is_complete": false,
-  "completion_evidence": "for done only: exact visible text confirming the full requested result",
+  "completion_evidence": ["for done only: exact visible text", "another exact visible fragment if needed"],
   "plan": {"strategy": "short approach name", "subgoal": "current intermediate goal", "expected_observation": "visible evidence to seek", "alternatives": ["another approach", "third approach"]}
 }
 
@@ -87,6 +88,7 @@ Available actions:
 - replan: {} - Abandon a stalled strategy; choose an alternative. This does not move the UI.
 - done: {} - Task is complete and the current screen confirms the requested result
 - failed: {} - Task cannot be completed; explain the obstacle
+- continue_task: {"missing_condition": "precise unmet requirement or observation needed"} - Only during completion verification: explicitly resume an unfinished task; this performs no UI action
 
 Rules:
 - You will receive a TEXT DUMP of the accessibility tree containing exact text strings and center coordinates.
@@ -98,7 +100,8 @@ Rules:
 - A wrong control, rejected action or query that did not stick is an INTERACTION failure, not proof the strategy is wrong. Retain the strategy/subgoal and try another appropriate control/input method in the same search flow. Use strategy replanning only after distinct local attempts are exhausted or a repeated closed cycle is observed. The executor already waits after each action; wait only for visible loading.
 - After typing a search query, use press_enter at most once. It is unsupported on Android TV because it can type the focused keyboard letter. If rejected, keep the query and activate the application's explicit search/submit control: look for a clickable Button inside or next to the editable field, even if it has no text. Do not retry Enter or press a letter key. Dismiss the keyboard with press_back only if it is visibly open.
 - Continue a useful navigation sequence across different observed states, including repeated use of the same navigation key. Change route when observations show a cycle or repeated rejection. Consider global navigation actions as well as visible app controls.
-- completion_evidence is a top-level JSON string for done, separate from reasoning and params. A formatting repair does not require changing the successful navigation route.
+- completion_evidence is a top-level string or array of 1–4 strings for done, separate from reasoning and params. Copy exact CURRENT visible text, 3–512 characters per fragment. Put separate labels in separate strings instead of joining them into a sentence. A formatting repair does not require changing the successful navigation route.
+- The ORIGINAL USER REQUEST defines completion. The working goal is only a restatement: do not add requirements or continue optimizing quality/preferences that the user did not ask for. Once the requested result is reached, verify it and stop.
 - Use done ONLY after reading a subsequent screen that confirms the FULL requested result, including its requested mode (for example a live player rather than a listing or guide). Include completion_evidence copied exactly from that screen; omit done when evidence is insufficient. An accepted click or opened app does not prove the full task succeeded.
 - Never type letters through the keyboard to submit. Use press_enter; if it fails, choose a visible search button or report failed.
 - If you need to find something by scrolling, scroll and then check the screen again.
@@ -129,6 +132,17 @@ Rules:
     return text.trim();
   }
 
+  Map<String, dynamic> _decodeAction(String response) {
+    final value = jsonDecode(_extractJson(response));
+    if (value is! Map<String, dynamic> ||
+        value['action'] is! String ||
+        (value['params'] != null && value['params'] is! Map<String, dynamic>) ||
+        (value['reasoning'] != null && value['reasoning'] is! String)) {
+      throw const FormatException('Invalid task decision fields');
+    }
+    return value;
+  }
+
   /// Execute a multi-step task with LLM guidance
   Future<TaskResult> executeTask(
     String userGoal, {
@@ -147,6 +161,7 @@ Rules:
         userGoal,
         diagnostic,
         AppVoicePolicy.allows(trustedUserRequest),
+        trustedUserRequest,
       );
       return result;
     } finally {
@@ -160,6 +175,7 @@ Rules:
     String userGoal,
     DiagnosticSession diagnostic,
     bool voiceAllowed,
+    String? originalRequest,
   ) async {
     await ScreenAutomationService.logToNative(
       "[TaskExecutor] executeTask() CALLED",
@@ -190,6 +206,7 @@ Rules:
     final shortcut = _getNavigationShortcut(userGoal);
     String lastAction = '';
     final progressGuard = TaskProgressGuard();
+    final verification = CompletionVerification();
     final memory = TaskMemorySession(_appMemory);
     final directTouchAvailable = await _screenService.canDispatchTouch();
     int consecutiveFailures = 0;
@@ -353,9 +370,11 @@ Rules:
 
       // 2. Build the prompt (system prompt is sent separately via sendTaskMessage)
       final prompt =
-          '''TASK: $userGoal
+          '''ORIGINAL USER REQUEST: ${originalRequest?.trim().isNotEmpty == true ? originalRequest!.trim() : userGoal}
+TASK (working restatement): $userGoal
 
 DEVICE DIRECT TOUCH: ${directTouchAvailable ? "available; TV keyboard must still be closed" : "UNAVAILABLE on this display. Do not propose tap_at or gesture-only recovery; use accessible controls and global navigation."}
+${verification.prompt}
 CURRENT SCREEN TEXT DUMP:
 $screenContent$prevResultStr$failureHint
 ${progressGuard.context}
@@ -428,6 +447,16 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           'step': step + 1,
           'reason': e is TimeoutException ? 'timeout' : 'connection_error',
         });
+        if (verification.active) {
+          return _stopUnverified(
+            userGoal,
+            totalTokens,
+            step + 1,
+            results,
+            diagnostic,
+            cause: e is TimeoutException ? 'timeout' : 'connection_error',
+          );
+        }
         results.add('AI error: $e');
         _report('Error: $e');
         await _notificationService.showTaskCompleteNotification(
@@ -472,9 +501,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       // 4. Parse the action (with one retry on failure)
       Map<String, dynamic>? actionJson;
       try {
-        String jsonStr = _extractJson(response);
-
-        actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
+        actionJson = _decodeAction(response);
       } catch (firstError) {
         // First attempt failed — retry once
         developer.log(
@@ -513,9 +540,28 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           totalTokens += retryResponse.totalTokens;
           developer.log('Received formatting retry', name: 'PrivateAgent');
 
-          String jsonStr = _extractJson(retryResponse.content);
-          actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
+          actionJson = _decodeAction(retryResponse.content);
         } catch (e) {
+          if (_cancelled) {
+            await TaskHistoryLogger.logTask(
+              userGoal,
+              'Cancelled',
+              totalTokens,
+              step,
+              [...results, 'Task cancelled.'],
+            );
+            return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
+          }
+          if (verification.active) {
+            return _stopUnverified(
+              userGoal,
+              totalTokens,
+              step + 1,
+              results,
+              diagnostic,
+              cause: 'format_error',
+            );
+          }
           results.add('Step ${step + 1}: Error after retry: $e');
 
           String debugInfo = 'Error: $e';
@@ -564,6 +610,44 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         'action': action,
         'plan_revision': progressGuard.planRevision,
       });
+      if (verification.active && action != 'done') {
+        if (action == 'continue_task' &&
+            verification.resume(params['missing_condition'])) {
+          results.add(
+            'Verification paused explicitly: ${params['missing_condition']}. Preserve achieved parts of the ORIGINAL request; inspect only what is missing.',
+          );
+          await diagnostic.event('verification_resume', {
+            'step': step + 1,
+            'reason': 'missing_condition',
+          });
+          continue;
+        }
+        verification.rejectAction();
+        await diagnostic.event('verification_action_blocked', {
+          'step': step + 1,
+          'action': action,
+          'reason': 'verification_pending',
+        });
+        if (verification.exhausted || action == 'failed') {
+          return _stopUnverified(
+            userGoal,
+            totalTokens,
+            step + 1,
+            results,
+            diagnostic,
+          );
+        }
+        results.add(
+          'Completion verification pending: the proposed action was not dispatched. Correct the evidence or explicitly identify the missing condition with continue_task.',
+        );
+        continue;
+      }
+      if (action == 'continue_task') {
+        results.add(
+          'continue_task is only available during completion verification; observe and choose the next ordinary task action.',
+        );
+        continue;
+      }
       if ((action == 'replan' || action == 'failed') &&
           progressGuard.deferStrategyChange) {
         results.add(
@@ -735,25 +819,34 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           return TaskResult(TaskStatus.failed, message);
 
         case 'done':
-          final evidence = actionJson['completion_evidence'];
-          if (evidence is! String ||
-              evidence.trim().length < 3 ||
-              !screenContent.contains(evidence.trim())) {
-            final problem = evidence is! String || evidence.trim().length < 3
-                ? 'missing top-level completion_evidence string'
+          final evidence = CompletionEvidence.inspect(
+            actionJson['completion_evidence'],
+            screenContent,
+          );
+          if (!evidence.accepted) {
+            verification.rejectEvidence();
+            final problem = evidence.reason == 'completion_evidence_missing'
+                ? 'missing top-level completion_evidence string or valid array'
                 : 'completion_evidence does not occur in the current screen dump';
             actionResult =
                 'Completion not accepted: $problem. '
-                'If the FULL goal is visible, reply with {"action":"done","completion_evidence":"<exact visible text>","reasoning":"<why it proves the full goal>"}. '
-                'Otherwise verify the result from the actual screen. Keep the current plan; do not navigate away merely to repair JSON. A selected listing is not playback.';
+                'Read-only verification is now required. If the FULL original request is satisfied, reply with done and exact visible fragments in completion_evidence. '
+                'Otherwise use continue_task with the precise missing_condition. Keep the current plan; navigation is blocked while repairing the proof. A selected listing is not playback.';
             await diagnostic.event('completion_rejected', {
               'step': step + 1,
-              'reason': evidence is String
-                  ? 'completion_evidence_mismatch'
-                  : 'completion_evidence_missing',
+              ...evidence.diagnosticFields,
             });
             results.add(actionResult);
             _report(actionResult);
+            if (verification.exhausted) {
+              return _stopUnverified(
+                userGoal,
+                totalTokens,
+                step + 1,
+                results,
+                diagnostic,
+              );
+            }
             continue;
           }
           await memory.completed(memoryContext);
@@ -845,6 +938,15 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       }
     }
 
+    if (verification.active) {
+      return _stopUnverified(
+        userGoal,
+        totalTokens,
+        _aiService.maxSteps,
+        results,
+        diagnostic,
+      );
+    }
     results.add(
       'Reached maximum steps (${_aiService.maxSteps}). Task may be incomplete.',
     );
@@ -867,6 +969,32 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       TaskStatus.failed,
       'I could not complete the task within the allowed steps.',
     );
+  }
+
+  Future<TaskResult> _stopUnverified(
+    String goal,
+    int tokens,
+    int steps,
+    List<String> results,
+    DiagnosticSession diagnostic, {
+    String cause = 'verification_pending',
+  }) async {
+    const message =
+        'I stopped without further navigation because completion could not be verified. The task may already be complete; please check the current screen.';
+    _report(message);
+    await diagnostic.event('verification_unresolved', {
+      'step': steps,
+      'reason': cause,
+    });
+    await TaskHistoryLogger.logTask(goal, 'Unverified', tokens, steps, [
+      ...results,
+      message,
+    ]);
+    await _notificationService.showTaskCompleteNotification(
+      'Result needs verification',
+      message,
+    );
+    return const TaskResult(TaskStatus.failed, message);
   }
 
   void _report(String message) {

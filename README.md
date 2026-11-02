@@ -74,6 +74,19 @@ request timing/token counts. They exclude raw screen dumps, typed values, voice
 transcripts, model reasoning and credentials. This export does not include the
 separate recent task history. Storage failures do not change control outcomes.
 
+A rejected `done` starts a read-only completion check with at most two repair
+decisions, also counted against the overall task budget. Navigation, text entry
+and replanning are blocked during this check. Evidence can be one exact visible
+string or 1–4 separate exact fragments from the current observation; older screens
+and normalized/fuzzy matches are not accepted. Diagnostics record only counts and
+match booleans. The model must either repair its proof or explicitly identify a
+missing requirement/observation using `continue_task` before further navigation.
+If verification remains inconclusive, the app preserves the screen, records
+`Unverified` in recent history and reports that the result needs checking; it does
+not claim success. Valid text grounding is not an independent semantic goal oracle.
+The original user request remains authoritative over a model's working restatement;
+unrequested quality improvements must not prolong a completed task.
+
 A rejected/ineffective control now requests local interaction repair while retaining
 the strategy/subgoal; repeated closed cycles still permit strategy replanning.
 Early replanning is deferred while local recovery remains (up to three distinct
