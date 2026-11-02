@@ -36,6 +36,7 @@ class ActionHandler {
     AgentAction action, {
     AiService? aiService,
     void Function(String)? onProgress,
+    String? originalRequest,
   }) async {
     try {
       String result;
@@ -176,7 +177,10 @@ class ActionHandler {
                 onProgress: onProgress,
               );
           try {
-            final outcome = await _currentExecutor!.executeTask(goal);
+            final outcome = await _currentExecutor!.executeTask(
+              goal,
+              trustedUserRequest: originalRequest,
+            );
             return AgentActionResult(
               actionType: action.action,
               success: outcome.success,

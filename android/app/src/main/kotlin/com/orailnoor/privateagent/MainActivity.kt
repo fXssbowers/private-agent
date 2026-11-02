@@ -150,6 +150,31 @@ class MainActivity : FlutterActivity() {
                             }
                         }
 
+                        "diagnosticState" -> result.success(DiagnosticTrace.state(context))
+                        "setDiagnosticEnabled" -> {
+                            DiagnosticTrace.setEnabled(context, call.argument<Boolean>("enabled") == true)
+                            result.success(DiagnosticTrace.state(context))
+                        }
+                        "clearDiagnosticTrace" -> {
+                            try { DiagnosticTrace.clear(context); result.success(true) }
+                            catch (_: Exception) { result.error("CLEAR_FAILED", "Could not clear diagnostics", null) }
+                        }
+                        "exportDiagnosticTrace" -> {
+                            try { result.success(DiagnosticTrace.export(context)) }
+                            catch (_: Exception) { result.error("EXPORT_FAILED", "Could not export diagnostic trace", null) }
+                        }
+                        "diagnosticEvent" -> {
+                            DiagnosticTrace.append(context, call.argument<String>("task") ?: "", call.argument<String>("event") ?: "", call.argument<Map<String, Any?>>("fields") ?: emptyMap())
+                            result.success(true)
+                        }
+                        "performUiAction" -> {
+                            val service = AgentAccessibilityService.instance
+                            if (service == null) result.success(mapOf("accepted" to false, "reason" to "service_unavailable"))
+                            else service.performUiAction(call.argument<String>("action") ?: "", call.argument<Map<String, Any?>>("params") ?: emptyMap(),
+                                call.argument<String>("task") ?: "", call.argument<Int>("step") ?: 0,
+                                call.argument<Boolean>("voice_allowed") == true) { result.success(it) }
+                        }
+
                         "canDispatchTouch" -> {
                             result.success(AgentAccessibilityService.instance?.canDispatchTouch() ?: false)
                         }

@@ -31,6 +31,10 @@ class TvControlInstrumentation : Instrumentation() {
             }
             val control = checkNotNull(service) { "Accessibility service did not bind" }
             when (options.getString("scenario", "fixture")) {
+                "diagnostics" -> {
+                    runDiagnostics(control)
+                    report.putString("result", "PASS: bounded/redacted trace; voice blocked by text/coordinates/structural role; editable voice hint typed directly; explicit voice opt-in isolated")
+                }
                 "stremio" -> {
                     targetContext.startActivity(Intent().setComponent(ComponentName("com.stremio.one", "com.stremio.tv.MainActivity")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                     SystemClock.sleep(4000)
@@ -143,6 +147,88 @@ class TvControlInstrumentation : Instrumentation() {
             finish(Activity.RESULT_CANCELED, report)
         }
     }
+    private fun runDiagnostics(control: AgentAccessibilityService) {
+        val fixtureDir = java.io.File(targetContext.cacheDir, "diagnostic_fixture")
+        val context = object : android.content.ContextWrapper(targetContext) {
+            override fun getFilesDir() = fixtureDir.apply { mkdirs() }
+            override fun getSharedPreferences(name: String, mode: Int) = targetContext.getSharedPreferences("fixture_$name", mode)
+        }
+        val wasEnabled = DiagnosticTrace.enabled(context)
+        val task = "diagnostic_fixture"
+        val canary = "sk-testDiagnosticCanary123456789"
+        DiagnosticTrace.setEnabled(context, true)
+        try {
+            DiagnosticTrace.clear(context)
+            for (i in 0 until 2000) DiagnosticTrace.append(context, task, "quota_test", mapOf("step" to i, "action" to "click_at", "reason" to "accepted"))
+            check((DiagnosticTrace.state(context)["bytes"] as Long) <= DiagnosticTrace.RING_BYTES) { "Diagnostic quota exceeded" }
+            DiagnosticTrace.clear(context)
+            DiagnosticTrace.append(context, task, "privacy_test", mapOf("status" to "started", "api_key" to canary, "text" to canary, "reason" to canary, "transcript" to canary, "class" to "ghp_testDiagnosticCanary123456789"))
+            DiagnosticTrace.append(context, canary, "privacy_test", mapOf("action" to "click_at"))
+            targetContext.startActivity(Intent().setComponent(ComponentName(this.context.packageName, DiagnosticFixtureActivity::class.java.name)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            SystemClock.sleep(1500)
+            fun perform(action: String, params: Map<String, Any?>, voice: Boolean = false): Map<String, Any?> {
+                val latch = CountDownLatch(1)
+                var result = emptyMap<String, Any?>()
+                runOnMainSync { control.performUiAction(action, params, "", 1, voice) { result = it; latch.countDown() } }
+                check(latch.await(4, TimeUnit.SECONDS)) { "Detailed action timed out" }
+                DiagnosticTrace.append(context, task, "native_result", result)
+                return result
+            }
+            fun bounds(label: String): Map<*, *> {
+                for (i in 0 until 20) {
+                    val found = nodes(control).firstOrNull { it["text"]?.toString()?.equals(label, true) == true || it["contentDescription"]?.toString()?.equals(label, true) == true }
+                    if (found != null) return found["bounds"] as Map<*, *>
+                    SystemClock.sleep(200)
+                }
+                error("Fixture control unavailable")
+            }
+            val mic = bounds("Voice search")
+            val mx = ((mic["left"] as Int) + (mic["right"] as Int)) / 2.0
+            val my = ((mic["top"] as Int) + (mic["bottom"] as Int)) / 2.0
+            for ((action, params) in listOf("click_text" to mapOf("text" to "Voice search"), "click_at" to mapOf("x" to mx, "y" to my), "tap_at" to mapOf("x" to mx, "y" to my), "click_text" to mapOf("text" to "Azione di ricerca"))) {
+                val result = perform(action, params)
+                check(result["accepted"] == false && result["reason"] == "voice_control_blocked") { "Voice guard failed for $action" }
+            }
+            check(perform("click_text", mapOf("text" to "Search action"))["accepted"] == true) { "Ordinary search submit was mistaken for voice" }
+            check(nodes(control).any { it["text"] == "SUBMIT_SELECTED" }) { "Ordinary search submit did not activate" }
+            check(perform("click_text", mapOf("text" to "Fallback search area"))["reason"] == "voice_control_blocked") { "Text fallback bypassed microphone protection" }
+            val normalBounds = bounds("Normal control")
+            val nx = ((normalBounds["left"] as Int) + (normalBounds["right"] as Int)) / 2f
+            val ny = ((normalBounds["top"] as Int) + (normalBounds["bottom"] as Int)) / 2f
+            // Capture the production trace context into the isolated test ring.
+            val touchTrace = UiActionTrace(context, task, 1, "tap_at", false)
+            val touchLatch = CountDownLatch(1)
+            var touchResult = emptyMap<String, Any?>()
+            runOnMainSync { touchTrace.scoped { control.tapAtCoordinates(nx, ny) { touchResult = touchTrace.finish(it); touchLatch.countDown() } } }
+            check(touchLatch.await(4, TimeUnit.SECONDS))
+            check(touchResult["role"] == "control" && touchResult["control_key"].toString().isNotEmpty()) { "Touch target was not resolved" }
+            check(touchTrace.target["bounds"] == listOf(normalBounds["left"], normalBounds["top"], normalBounds["right"], normalBounds["bottom"])) { "Touch attributed to a different control" }
+            val typed = perform("type_text", mapOf("text" to canary, "field_hint" to "Parla per cercare"))
+            check(typed["accepted"] == true && typed["role"] == "text_input") { "Voice hint prevented direct text input" }
+            check(nodes(control).any { it["text"] == canary }) { "Text did not reach field" }
+            check(nodes(control).none { it["text"] == "VOICE_SELECTED" || it["text"] == "ORB_SELECTED" }) { "Text entry activated voice" }
+            if (nodes(control).any { it["className"] == "KeyboardStatus" }) {
+                action { done -> done(control.pressBack()) }; SystemClock.sleep(500)
+            }
+            val allowed = perform("click_text", mapOf("text" to "Voice search"), true)
+            check(allowed["accepted"] == true) { "Explicit voice opt-in rejected" }
+            check(perform("click_text", mapOf("text" to "Normal control"))["accepted"] == true)
+            check(perform("click_text", mapOf("text" to "Voice search"))["reason"] == "voice_control_blocked")
+            check(nodes(control).any { it["text"] == "SAFE_SELECTED" }) { "Per-call voice permission leaked" }
+            DiagnosticTrace.append(context, task, "task_end", mapOf("status" to "succeeded"))
+            val dir = java.io.File(context.filesDir, "diagnostics")
+            val files = listOf(java.io.File(dir, "current.jsonl"), java.io.File(dir, "previous.jsonl")).filter { it.exists() }
+            val data = files.joinToString("\n") { it.readText() }
+            check(files.sumOf { it.length() } <= DiagnosticTrace.RING_BYTES) { "Trace ring exceeded bound" }
+            check(!data.contains(canary) && !data.contains("ghp_testDiagnosticCanary123456789") && !data.contains("\"api_key\"") && !data.contains("\"transcript\"")) { "Sensitive values entered trace" }
+            check(data.contains("voice_control_blocked") && data.contains("text_input")) { "Trace lacks resolved interaction evidence" }
+            check(data.contains("requested_point") && data.contains("resolved_target")) { "Trace lacks touch request/target evidence" }
+        } finally {
+            DiagnosticTrace.setEnabled(context, wasEnabled)
+            fixtureDir.deleteRecursively()
+        }
+    }
+
     private fun checkQuery(service: AgentAccessibilityService, stage: String) {
         val fields = nodes(service).filter { it["isEditable"] == true }.map { it["text"]?.toString().orEmpty() }
         sendStatus(0, Bundle().apply { putString("query_stage", "$stage: $fields") })
@@ -207,6 +293,43 @@ class TvControlFixtureActivity : Activity() {
             }
         }.apply { text = "Touch alternative"; isClickable = true; minHeight = 80 }
         layout.addView(button); layout.addView(editor); layout.addView(search); layout.addView(result); layout.addView(virtual); layout.addView(touchAlternative); layout.addView(status)
+        setContentView(layout)
+    }
+}
+
+class DiagnosticFixtureActivity : Activity() {
+    override fun onCreate(state: Bundle?) {
+        super.onCreate(state)
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val status = TextView(this).apply { text = "IDLE" }
+        val editor = EditText(this).apply { hint = "Parla per cercare"; setSingleLine(true) }
+        val voice = Button(this).apply { text = "Voice search"; setOnClickListener { status.text = "VOICE_SELECTED" } }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val orb = android.widget.FrameLayout(this).apply {
+            isFocusable = true; isClickable = true
+            layoutParams = LinearLayout.LayoutParams(124, 124)
+            setOnClickListener { status.text = "ORB_SELECTED" }
+        }
+        orb.addView(android.widget.ImageView(this).apply { contentDescription = "Azione di ricerca" }, android.widget.FrameLayout.LayoutParams(80, 80))
+        row.addView(orb)
+        row.addView(object : EditText(this) {
+            override fun onInitializeAccessibilityNodeInfo(info: android.view.accessibility.AccessibilityNodeInfo?) {
+                super.onInitializeAccessibilityNodeInfo(info)
+                info?.className = "androidx.leanback.widget.StreamingTextView"
+            }
+        }.apply { hint = "Other input" }, LinearLayout.LayoutParams(800, 124))
+        val ordinaryRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val ordinaryOrb = android.widget.FrameLayout(this).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { status.text = "SUBMIT_SELECTED" }
+        }
+        ordinaryOrb.addView(android.widget.ImageView(this).apply { contentDescription = "Search action" }, android.widget.FrameLayout.LayoutParams(80, 80))
+        ordinaryRow.addView(ordinaryOrb, LinearLayout.LayoutParams(124, 124))
+        ordinaryRow.addView(EditText(this).apply { hint = "Regular search" }, LinearLayout.LayoutParams(800, 124))
+        val normal = Button(this).apply { text = "Normal control"; setOnClickListener { status.text = "SAFE_SELECTED" } }
+        val fallbackArea = android.widget.FrameLayout(this).apply { contentDescription = "Fallback search area" }
+        fallbackArea.addView(Button(this).apply { text = "Microphone"; setOnClickListener { status.text = "VOICE_SELECTED" } }, android.widget.FrameLayout.LayoutParams(124, 124))
+        layout.addView(editor); layout.addView(voice); layout.addView(row); layout.addView(ordinaryRow); layout.addView(normal); layout.addView(fallbackArea, LinearLayout.LayoutParams(124, 124)); layout.addView(status)
         setContentView(layout)
     }
 }

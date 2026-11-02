@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:private_agent/models/ui_interaction_result.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_agent/models/agent_action.dart';
@@ -20,6 +21,7 @@ class Screen extends ScreenAutomationService {
   int backs = 0;
   int clicks = 0;
   int touches = 0;
+  int touchRequests = 0;
   bool touchSupported = true;
   @override
   Future<bool> canDispatchTouch() async => touchSupported;
@@ -27,6 +29,52 @@ class Screen extends ScreenAutomationService {
   Future<bool> tapAt(double x, double y) async {
     touches++;
     return true;
+  }
+
+  @override
+  Future<UiInteractionResult> performInteraction(
+    String action,
+    Map<String, dynamic> params, {
+    required String taskId,
+    required int step,
+    bool voiceAllowed = false,
+  }) async {
+    bool accepted;
+    switch (action) {
+      case 'click_at':
+        accepted = await clickAt(
+          (params['x'] as num).toDouble(),
+          (params['y'] as num).toDouble(),
+        );
+        break;
+      case 'tap_at':
+        touchRequests++;
+        if (!touchSupported)
+          return const UiInteractionResult(
+            accepted: false,
+            reason: 'display_unsupported',
+          );
+        accepted = await tapAt(
+          (params['x'] as num).toDouble(),
+          (params['y'] as num).toDouble(),
+        );
+        break;
+      case 'click_text':
+        accepted = await clickByText(params['text'] as String);
+        break;
+      case 'type_text':
+        accepted = await typeText(
+          params['text'] as String,
+          fieldHint: params['field_hint'] as String?,
+        );
+        break;
+      default:
+        accepted = false;
+    }
+    return UiInteractionResult(
+      accepted: accepted,
+      reason: accepted ? 'accepted' : 'native_rejected',
+    );
   }
 
   @override
@@ -86,6 +134,42 @@ class MemoryScreen extends Screen {
   @override
   Future<String> getCompressedScreenDescription(String task) async =>
       'APP: fixture.app\n[0] view "" [tap] center:(960,540)\n[1] btn "Cerca" [tap] center:(100,100)';
+}
+
+class RecoverableInput extends Screen {
+  String typed = '';
+  @override
+  Future<String> getCompressedScreenDescription(String task) async =>
+      'APP: fixture.app\n[0] input "$typed" [tap,edit] center:(50,50)';
+  @override
+  Future<bool> clickAt(double x, double y) async {
+    clicks++;
+    return false;
+  }
+
+  @override
+  Future<bool> typeText(String text, {String? fieldHint}) async {
+    typed = text;
+    return true;
+  }
+}
+
+class VoicePolicyScreen extends Screen {
+  bool? allowed;
+  @override
+  Future<UiInteractionResult> performInteraction(
+    String action,
+    Map<String, dynamic> params, {
+    required String taskId,
+    required int step,
+    bool voiceAllowed = false,
+  }) async {
+    allowed = voiceAllowed;
+    return const UiInteractionResult(
+      accepted: false,
+      reason: 'native_rejected',
+    );
+  }
 }
 
 class Notices extends NotificationService {
@@ -228,7 +312,7 @@ void main() {
       final ai = Model([
         '{"action":"click_at","params":{"x":50,"y":50}}',
         '{"action":"failed","reasoning":"Control not available"}',
-      ]);
+      ], limit: 2);
       final result = await executor(ai, screen).executeTask('search');
       expect(result.success, false);
       expect(ai.calls, 2);
@@ -339,7 +423,7 @@ void main() {
       expect(result.message, contains('allowed steps'));
       expect(ai.calls, 5);
       expect(screen.clicks, 2);
-      expect(ai.prompts[2], contains('STRATEGY CHANGE REQUIRED'));
+      expect(ai.prompts[2], contains('LOCAL REPAIR: required'));
       expect(ai.prompts[3], contains('"dispatched":false'));
     },
   );
@@ -578,11 +662,118 @@ void main() {
       final ai = Model([
         '{"action":"tap_at","params":{"x":50,"y":50}}',
         '{"action":"failed","reasoning":"No applicable route"}',
-      ]);
+      ], limit: 2);
       expect((await executor(ai, screen).executeTask('search')).success, false);
       expect(screen.touches, 0);
+      expect(screen.touchRequests, 1);
       expect(ai.prompts.first, contains('UNAVAILABLE on this display'));
       expect(ai.prompts.last, contains('Direct touch rejected'));
+    },
+  );
+  test(
+    'an input-control failure preserves search strategy and permits direct text recovery',
+    () async {
+      final ai = Model([
+        '{"action":"replan","plan":{"strategy":"text search","subgoal":"enter query","alternatives":["other route"]}}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"replan","plan":{"strategy":"abandon search"}}',
+        '{"action":"type_text","params":{"text":"demo"}}',
+        '{"action":"done","completion_evidence":"demo"}',
+      ]);
+      final screen = RecoverableInput();
+      expect(
+        (await executor(
+          ai,
+          screen,
+        ).executeTask('Enter demo in search')).success,
+        true,
+      );
+      expect(ai.prompts[3], contains('"strategy":"text search"'));
+      expect(ai.prompts[3], contains('Local interaction repair required'));
+      expect(ai.prompts.last, contains('LOCAL REPAIR: none'));
+      expect(screen.typed, 'demo');
+      expect(screen.clicks, 1);
+      expect(screen.backs, 0);
+    },
+  );
+  test(
+    'premature failure without declared alternatives still permits local input repair',
+    () async {
+      final ai = Model([
+        '{"action":"replan","plan":{"strategy":"text search","subgoal":"enter query"}}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"failed","reasoning":"Search is unavailable"}',
+        '{"action":"type_text","params":{"text":"demo"}}',
+        '{"action":"done","completion_evidence":"demo"}',
+      ]);
+      final screen = RecoverableInput();
+      expect(
+        (await executor(
+          ai,
+          screen,
+        ).executeTask('Enter demo in search')).success,
+        true,
+      );
+      expect(ai.prompts[3], contains('Local interaction repair required'));
+      expect(ai.prompts[3], contains('"strategy":"text search"'));
+      expect(screen.typed, 'demo');
+      expect(screen.clicks, 1);
+      expect(screen.backs, 0);
+    },
+  );
+  test(
+    'Stop during diagnostic initialization is not erased by task startup',
+    () async {
+      final state = Completer<Map<String, dynamic>>();
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('com.privateagent/accessibility'),
+            (call) async {
+              if (call.method == 'diagnosticState') return state.future;
+              return true;
+            },
+          );
+      try {
+        final ai = Model([]);
+        final runner = executor(ai, Screen());
+        final future = runner.executeTask('search');
+        await Future<void>.delayed(const Duration(milliseconds: 20));
+        runner.cancel();
+        state.complete({'enabled': true});
+        expect((await future).status, TaskStatus.cancelled);
+        expect(ai.calls, 0);
+      } finally {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('com.privateagent/accessibility'),
+              null,
+            );
+      }
+    },
+  );
+  test(
+    'rewritten task cannot grant voice permission absent from original request',
+    () async {
+      for (final original in ['Cerca demo', 'Avvia la ricerca vocale']) {
+        final ai = Model([
+          '{"action":"click_text","params":{"text":"Voice search"}}',
+          '{"action":"failed","reasoning":"Native unavailable"}',
+        ], limit: 2);
+        final screen = VoicePolicyScreen();
+        final handler = ActionHandler(
+          createTaskExecutor: (aiService, progress) => executor(ai, screen),
+        );
+        await handler.execute(
+          AgentAction(
+            action: 'execute_task',
+            params: {'goal': 'Avvia la ricerca vocale'},
+            response: '',
+          ),
+          aiService: ai,
+          originalRequest: original,
+        );
+        expect(screen.allowed, original == 'Avvia la ricerca vocale');
+      }
     },
   );
   test('confirmed completion propagates success', () async {

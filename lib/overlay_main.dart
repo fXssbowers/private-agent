@@ -248,7 +248,7 @@ class _OverlayAppState extends State<OverlayApp> {
       );
 
       _executor!
-          .executeTask(userTask)
+          .executeTask(userTask, trustedUserRequest: userTask)
           .then((res) {
             log("Overlay Task Finished");
             if (mounted) {

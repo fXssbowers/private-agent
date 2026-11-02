@@ -1,6 +1,7 @@
 import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:developer' as developer;
+import '../models/ui_interaction_result.dart';
 
 /// Dart bridge to the native AccessibilityService.
 /// Provides screen reading, UI element interaction, and gesture control.
@@ -123,6 +124,7 @@ class ScreenAutomationService {
       if (isScrollable) tags.add('scrollable');
       if (node['isFocused'] == true) tags.add('focused');
       if (node['isSelected'] == true) tags.add('selected');
+      if (node['controlRole'] == 'voice_search') tags.add('voice');
 
       final label = displayText.isNotEmpty ? '"$displayText"' : '(no text)';
       final type = className.isNotEmpty ? '[$className]' : '';
@@ -198,6 +200,7 @@ class ScreenAutomationService {
       if (isScrollable) tags.add('scroll');
       if (node['isFocused'] == true) tags.add('focused');
       if (node['isSelected'] == true) tags.add('selected');
+      if (node['controlRole'] == 'voice_search') tags.add('voice');
 
       // Simplify type
       String type = className.split('.').last;
@@ -237,7 +240,7 @@ class ScreenAutomationService {
     }
 
     final screenString = buffer.toString();
-    developer.log('Screen Dump Extracted:\n$screenString', name: 'ScreenAutomation');
+    developer.log('Prepared screen description (${nodes.length} nodes)', name: 'ScreenAutomation');
     return screenString;
   }
 
@@ -277,6 +280,30 @@ class ScreenAutomationService {
       return await _invoke<bool>('canDispatchTouch') ?? false;
     } catch (_) {
       return false;
+    }
+  }
+
+  Future<UiInteractionResult> performInteraction(
+    String action,
+    Map<String, dynamic> params, {
+    required String taskId,
+    required int step,
+    bool voiceAllowed = false,
+  }) async {
+    try {
+      final value = await _channel.invokeMethod<Map>('performUiAction', {
+        'action': action,
+        'params': params,
+        'task': taskId,
+        'step': step,
+        'voice_allowed': voiceAllowed,
+      });
+      return UiInteractionResult.fromMap(value ?? {});
+    } catch (_) {
+      return const UiInteractionResult(
+        accepted: false,
+        reason: 'native_exception',
+      );
     }
   }
 

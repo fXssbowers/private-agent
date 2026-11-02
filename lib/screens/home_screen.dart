@@ -160,8 +160,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final result = await _actionHandler.execute(
           action,
           aiService: _aiService,
+          originalRequest: text.trim(),
           onProgress: (msg) {
-            developer.log('Task progress: $msg', name: 'PrivateAgent');
+            developer.log('Task progress updated', name: 'PrivateAgent');
             _sendOverlayEvent('OVERLAY_PROGRESS', msg);
             if (mounted) {
               setState(() {

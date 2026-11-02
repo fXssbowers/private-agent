@@ -64,6 +64,31 @@ that observation without changing the task outcome. App memory is a hint, not an
 input capability: each full task still needs real-device validation. Design evidence
 and its limits are documented in [the research note](docs/research/adaptive-ui-exploration.md).
 
+Settings → UI diagnostics controls an opt-in structured trace. The native writer
+is shared by Flutter engines, keeps a 128 KiB ring (two 64 KiB files), and exports
+one owned Downloads copy of at most 128 KiB only when the user presses Export.
+The combined bound is 256 KiB. Clear removes the ring and that exported copy.
+Records contain task/step IDs, structural screen IDs, resolved control IDs/roles,
+bounds, chosen native transport, acceptance/rejection codes, plan revisions and
+request timing/token counts. They exclude raw screen dumps, typed values, voice
+transcripts, model reasoning and credentials. This export does not include the
+separate recent task history. Storage failures do not change control outcomes.
+
+A rejected/ineffective control now requests local interaction repair while retaining
+the strategy/subgoal; repeated closed cycles still permit strategy replanning.
+Early replanning is deferred while local recovery remains (up to three distinct
+failed controls or eight recovery decisions, within the overall task budget).
+Text entry already focuses its input, so the planner can type directly into a
+visible editable field instead of clicking search/voice controls first. Short
+queries are checked against the next visible input observation without persisting
+their values. Recognizable voice controls, including Leanback speech orbs, are
+blocked unless the caller's original user request explicitly asks for app voice
+input. The model's rewritten goal or action params cannot grant that permission.
+The opt-in is conservative: standard requests beginning with “Avvia la ricerca
+vocale” or “Start voice search” are recognized; ambiguous/negative requests default
+to text input. App-initiated voice recognition is a separate effect to diagnose;
+the agent does not revoke an application's microphone permission.
+
 The tested configuration uses the Custom provider, base URL
 `https://api.openai.com/v1`, model `gpt-6.1-terra`, and a 4096-token response limit.
 The Terra payload adaptation is restricted to that exact provider/model pair.

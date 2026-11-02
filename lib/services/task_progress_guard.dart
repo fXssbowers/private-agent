@@ -13,6 +13,35 @@ class TaskProgressGuard {
   String _screen = '';
   Map<String, dynamic>? _pending;
   bool _needsReplan = false;
+  bool _localRepair = false;
+  int _repairDecisions = 0;
+  final _failedControls = <String>{};
+  int _planRevision = 0;
+  bool get needsLocalRepair => _localRepair;
+  int get localFailures => _failedControls.length;
+  int get planRevision => _planRevision;
+  bool get deferStrategyChange =>
+      !_needsReplan &&
+      _localRepair &&
+      _failedControls.length < 3 &&
+      _repairDecisions < 8;
+
+  void requireLocalRepair(String controlKey) {
+    _localRepair = true;
+    if (controlKey.isNotEmpty && _failedControls.length < 16) {
+      _failedControls.add(controlKey);
+    }
+  }
+
+  void recoveryDecision() {
+    if (_localRepair) _repairDecisions++;
+  }
+
+  void interactionRecovered() {
+    _localRepair = false;
+    _repairDecisions = 0;
+    _failedControls.clear();
+  }
 
   String get currentState => _state;
   bool get needsReplan => _needsReplan;
@@ -51,6 +80,7 @@ class TaskProgressGuard {
         'from': from,
         'action': pending['action'],
         'params': pending['params'],
+        'control_key': pending['control_key'],
         'visits': 0,
         'ineffective': 0,
       },
@@ -61,8 +91,14 @@ class TaskProgressGuard {
     final ineffective =
         pending['accepted_by_android'] != true || from == _state;
     edge['ineffective'] = ineffective ? (edge['ineffective'] as int) + 1 : 0;
-    if ((edge['ineffective'] as int) >= 2 || _repeatedCycleStart() != null) {
+    if ((edge['ineffective'] as int) >= 2) {
+      requireLocalRepair(
+        pending['control_key'] as String? ?? '$from|$signature',
+      );
+    }
+    if (_repeatedCycleStart() != null) {
       _needsReplan = true;
+      _localRepair = false;
     }
   }
 
@@ -150,6 +186,7 @@ class TaskProgressGuard {
     if (_plan.isNotEmpty && strategy != _plan['strategy']) {
       abandon('Observed approach did not make useful progress.');
     }
+    if (_plan['strategy'] != strategy) _planRevision++;
     _plan = {
       'strategy': strategy,
       'subgoal': short(value['subgoal']),
@@ -182,6 +219,9 @@ class TaskProgressGuard {
     }
     _plan = {};
     _needsReplan = true;
+    _localRepair = false;
+    _repairDecisions = 0;
+    _failedControls.clear();
     // The graph is never reset by renaming/abandoning a strategy.
   }
 
@@ -204,9 +244,16 @@ class TaskProgressGuard {
     final ineffective = (edge['ineffective'] as int) >= 2;
     final cycle = _repeatedCycleStart()?['signature'] == _key(action, params);
     if (!ineffective && !cycle) return null;
-    _needsReplan = true;
+    if (cycle) {
+      _needsReplan = true;
+      _localRepair = false;
+    } else {
+      requireLocalRepair(
+        edge['control_key'] as String? ?? '$_state|${_key(action, params)}',
+      );
+    }
     final message = ineffective
-        ? 'Blocked: this state/action was ineffective twice. Abandon this branch and choose another route.'
+        ? 'Blocked: this state/action was ineffective twice. Repair this interaction with another control or input method while retaining the current strategy.'
         : 'Blocked: this transition repeats a known cycle without new observations. Replan; do not rename the same route.';
     _remember({
       'screen': _state,
@@ -222,13 +269,17 @@ class TaskProgressGuard {
     String action,
     Map<String, dynamic> params,
     bool accepted,
-    String result,
-  ) {
+    String result, {
+    String? controlKey,
+  }) {
     final attempt = <String, dynamic>{
       'screen': _state,
       'action': action,
       'params': params,
       'signature': _key(action, params),
+      'control_key': controlKey == null || controlKey.isEmpty
+          ? '$_state|${_key(action, params)}'
+          : controlKey,
       'result': result.length > 240 ? result.substring(0, 240) : result,
       'accepted_by_android': accepted,
       'strategy': _plan['strategy'] ?? 'unplanned',
@@ -245,6 +296,7 @@ class TaskProgressGuard {
   String get context =>
       '''CURRENT OBSERVED SCREEN ID: $_state
 ACTIVE PLAN: ${jsonEncode(_plan)}
+LOCAL REPAIR: ${_localRepair ? "required; preserve this strategy and subgoal, repair the control/input method first" : "none"}; distinct failed controls: ${_failedControls.length}; recovery decisions: $_repairDecisions
 UNTRIED STRATEGIES: ${jsonEncode(_alternatives)}
 ABANDONED STRATEGIES: ${jsonEncode(_abandoned)}
 OBSERVED TRANSITIONS: ${jsonEncode(_edges.values.toList())}

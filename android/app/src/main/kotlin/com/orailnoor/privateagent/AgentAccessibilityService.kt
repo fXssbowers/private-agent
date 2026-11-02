@@ -39,6 +39,9 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event != null && (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED)) {
+            DiagnosticTrace.windowEvent(this, event.eventType, event.packageName?.toString(), event.className?.toString())
+        }
         if (event == null) return
         val listener = eventListener ?: return
         
@@ -183,7 +186,8 @@ class AgentAccessibilityService : AccessibilityService() {
                     "className" to className.substringAfterLast('.'),
                     "viewId" to viewId,
                     "isClickable" to node.isClickable,
-                    "isEditable" to node.isEditable,
+                    "isEditable" to UiControlSemantics.textInput(node),
+                    "controlRole" to UiControlSemantics.descriptor(node)["role"],
                     "isScrollable" to node.isScrollable,
                     "isCheckable" to node.isCheckable,
                     "isChecked" to node.isChecked,
@@ -242,9 +246,29 @@ class AgentAccessibilityService : AccessibilityService() {
 
     // ─── Actions ─────────────────────────────────────────────────
 
+    fun performUiAction(action: String, params: Map<String, Any?>, task: String, step: Int, voiceAllowed: Boolean, callback: (Map<String, Any?>) -> Unit) {
+        val trace = UiActionTrace(this, task, step, action, voiceAllowed)
+        trace.scoped {
+            val done: (Boolean) -> Unit = { callback(trace.finish(it)) }
+            when (action) {
+                "click_text" -> clickByText(params["text"] as? String ?: "", done)
+                "click_at" -> clickAtCoordinates((params["x"] as? Number)?.toFloat() ?: Float.NaN, (params["y"] as? Number)?.toFloat() ?: Float.NaN, done)
+                "tap_at" -> tapAtCoordinates((params["x"] as? Number)?.toFloat() ?: Float.NaN, (params["y"] as? Number)?.toFloat() ?: Float.NaN, done)
+                "type_text" -> done(typeText(params["text"] as? String ?: "", params["field_hint"] as? String))
+                else -> done(false)
+            }
+        }
+    }
+
     /** Resolve an actual accessible control before falling back to a gesture. */
     fun clickByText(targetText: String, callback: (Boolean) -> Unit) {
-        if (targetText.isBlank()) { callback(false); return }
+        if (UiActionTrace.current.get() == null) {
+            UiActionTrace(this, "", 0, "click_text", false).scoped { clickByText(targetText, callback) }
+            return
+        }
+        val trace = UiActionTrace.current.get()
+        trace?.requestedText(targetText)
+        if (targetText.isBlank()) { trace?.reason = "not_found"; callback(false); return }
         val orderedWindows = windows.sortedBy { if (it.type == AccessibilityWindowInfo.TYPE_APPLICATION) 0 else 1 }
         for (skipEditable in listOf(true, false)) {
             for (window in orderedWindows) {
@@ -260,7 +284,9 @@ class AgentAccessibilityService : AccessibilityService() {
                         val clicked = clickNodeOrParent(node)
                         val rect = Rect()
                         node.getBoundsInScreen(rect)
+                        if (!clicked && trace?.reason != "voice_control_blocked") trace?.resolved(node, "gesture_touch")
                         node.recycle()
+                        if (trace?.reason == "voice_control_blocked") { callback(false); return }
                         if (clicked) callback(true)
                         else if (!rect.isEmpty && !keyboardOpenOnTv()) dispatchTap(rect.centerX().toFloat(), rect.centerY().toFloat(), callback)
                         else callback(false)
@@ -269,6 +295,7 @@ class AgentAccessibilityService : AccessibilityService() {
                 }
             }
         }
+        trace?.reason = "not_found"
         callback(false)
     }
 
@@ -287,10 +314,18 @@ class AgentAccessibilityService : AccessibilityService() {
     }
 
     private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
+        val trace = UiActionTrace.current.get()
         var target: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
         var originalNode = true
         while (target != null) {
+            trace?.resolved(target, if (originalNode) "accessibility_click" else "accessibility_ancestor")
+            if (UiControlSemantics.voiceControl(target) && trace?.voiceAllowed != true) {
+                trace?.reason = "voice_control_blocked"
+                target.recycle()
+                return false
+            }
             // Virtual controls can implement ACTION_CLICK without isClickable.
+            if (target.isVisibleToUser && target.isEnabled && (originalNode || target.isClickable)) trace?.beforeDispatch()
             val clicked = target.isVisibleToUser && target.isEnabled && (originalNode || target.isClickable) &&
                 target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             val parent = if (clicked) null else target.parent
@@ -315,23 +350,76 @@ class AgentAccessibilityService : AccessibilityService() {
         return if (node.isClickable && node.isEnabled) AccessibilityNodeInfo.obtain(node) else null
     }
 
+    /** Deepest visible hit, including virtual/non-clickable touch controls. */
+    private fun findTouchTargetAt(node: AccessibilityNodeInfo, x: Int, y: Int): AccessibilityNodeInfo? {
+        val bounds = Rect(); node.getBoundsInScreen(bounds)
+        if (!node.isVisibleToUser || !bounds.contains(x, y)) return null
+        for (i in node.childCount - 1 downTo 0) {
+            val child = node.getChild(i) ?: continue
+            val found = findTouchTargetAt(child, x, y); child.recycle()
+            if (found != null) return found
+        }
+        return AccessibilityNodeInfo.obtain(node)
+    }
+
+    private fun resolveTouchPoint(x: Float, y: Float) {
+        val trace = UiActionTrace.current.get() ?: return
+        trace.target = emptyMap()
+        for (window in windows) {
+            val root = window.root ?: continue
+            if (root.packageName?.toString() == ownPackageName || (isTelevisionDevice() && isKeyboardWindow(window, root))) { root.recycle(); continue }
+            val target = findTouchTargetAt(root, x.toInt(), y.toInt()); root.recycle()
+            if (target != null) {
+                trace.resolved(target, "gesture_touch"); target.recycle(); return
+            }
+        }
+    }
+
+    private fun voiceControlAt(node: AccessibilityNodeInfo, x: Int, y: Int): AccessibilityNodeInfo? {
+        val bounds = Rect(); node.getBoundsInScreen(bounds)
+        if (!node.isVisibleToUser || !bounds.contains(x, y)) return null
+        for (i in node.childCount - 1 downTo 0) {
+            val child = node.getChild(i) ?: continue
+            val found = voiceControlAt(child, x, y); child.recycle()
+            if (found != null) return found
+        }
+        return if (UiControlSemantics.voiceControl(node)) AccessibilityNodeInfo.obtain(node) else null
+    }
+
+    private fun rejectVoicePoint(root: AccessibilityNodeInfo, x: Int, y: Int): Boolean {
+        val trace = UiActionTrace.current.get()
+        if (trace?.voiceAllowed == true) return false
+        val voice = voiceControlAt(root, x, y) ?: return false
+        trace?.resolved(voice, "none"); trace?.reason = "voice_control_blocked"
+        voice.recycle()
+        return true
+    }
+
     fun clickAtCoordinates(x: Float, y: Float, callback: (Boolean) -> Unit) {
+        if (UiActionTrace.current.get() == null) {
+            UiActionTrace(this, "", 0, "click_at", false).scoped { clickAtCoordinates(x, y, callback) }
+            return
+        }
+        val trace = UiActionTrace.current.get()
+        trace?.requestedPoint(x, y)
         if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0 ||
-            (isTelevisionDevice() && windows.isEmpty())) { callback(false); return }
+            (isTelevisionDevice() && windows.isEmpty())) { trace?.reason = "invalid_coordinates"; callback(false); return }
         for (window in windows) {
             val root = window.root ?: continue
             if (root.packageName?.toString() == ownPackageName ||
                 (isTelevisionDevice() && isKeyboardWindow(window, root))) { root.recycle(); continue }
+            if (rejectVoicePoint(root, x.toInt(), y.toInt())) { root.recycle(); callback(false); return }
             val node = findClickableAt(root, x.toInt(), y.toInt())
             root.recycle()
             if (node != null) {
                 val clicked = clickNodeOrParent(node)
                 node.recycle()
+                if (trace?.reason == "voice_control_blocked") { callback(false); return }
                 if (clicked) { callback(true); return }
                 break
             }
         }
-        if (keyboardOpenOnTv()) callback(false) else dispatchTap(x, y, callback)
+        if (keyboardOpenOnTv()) { trace?.reason = "keyboard_open"; callback(false) } else dispatchTap(x, y, callback)
     }
 
     // Android 11 checks Configuration.TOUCHSCREEN_FINGER independently of
@@ -341,28 +429,56 @@ class AgentAccessibilityService : AccessibilityService() {
 
     /** Explicit physical touch alternative: never reinterpret it as ACTION_CLICK. */
     fun tapAtCoordinates(x: Float, y: Float, callback: (Boolean) -> Unit) {
+        if (UiActionTrace.current.get() == null) {
+            UiActionTrace(this, "", 0, "tap_at", false).scoped { tapAtCoordinates(x, y, callback) }
+            return
+        }
+        val trace = UiActionTrace.current.get()
+        trace?.requestedPoint(x, y)
         val display = resources.displayMetrics
-        if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0 ||
-            x >= display.widthPixels || y >= display.heightPixels || !canDispatchTouch() ||
-            (isTelevisionDevice() && windows.isEmpty()) || keyboardOpenOnTv()) {
-            callback(false); return
+        if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0 || x >= display.widthPixels || y >= display.heightPixels) {
+            trace?.reason = "invalid_coordinates"; callback(false); return
+        }
+        for (window in windows) {
+            val root = window.root ?: continue
+            if (root.packageName?.toString() == ownPackageName || (isTelevisionDevice() && isKeyboardWindow(window, root))) { root.recycle(); continue }
+            val blocked = rejectVoicePoint(root, x.toInt(), y.toInt()); root.recycle()
+            if (blocked) { callback(false); return }
+        }
+        resolveTouchPoint(x, y)
+        if (!canDispatchTouch()) { trace?.reason = "display_unsupported"; callback(false); return }
+        if ((isTelevisionDevice() && windows.isEmpty()) || keyboardOpenOnTv()) {
+            trace?.reason = "keyboard_open"; callback(false); return
         }
         dispatchTap(x, y, callback)
     }
 
     private fun dispatchTap(x: Float, y: Float, callback: (Boolean) -> Unit) {
+        val trace = UiActionTrace.current.get()
+        trace?.requestedPoint(x, y)
+        for (window in windows) {
+            val root = window.root ?: continue
+            if (root.packageName?.toString() == ownPackageName || (isTelevisionDevice() && isKeyboardWindow(window, root))) { root.recycle(); continue }
+            val blocked = rejectVoicePoint(root, x.toInt(), y.toInt()); root.recycle()
+            if (blocked) { callback(false); return }
+        }
+        resolveTouchPoint(x, y)
+        if (!canDispatchTouch()) { trace?.reason = "display_unsupported"; callback(false); return }
+        trace?.transport = "gesture_touch"
+        trace?.beforeDispatch()
         val path = Path().apply { moveTo(x, y) }
         dispatchCompletedGesture(GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 100)).build(), callback)
     }
 
     private fun dispatchCompletedGesture(gesture: GestureDescription, callback: (Boolean) -> Unit) {
+        val trace = UiActionTrace.current.get()
         val handler = Handler(Looper.getMainLooper())
         var finished = false
         fun finish(success: Boolean) {
             if (!finished) { finished = true; callback(success) }
         }
-        val timeout = Runnable { finish(false) }
+        val timeout = Runnable { trace?.reason = "gesture_timeout"; finish(false) }
         handler.postDelayed(timeout, 2500)
         try {
             val accepted = dispatchGesture(gesture, object : GestureResultCallback() {
@@ -370,11 +486,13 @@ class AgentAccessibilityService : AccessibilityService() {
                     handler.removeCallbacks(timeout); finish(true)
                 }
                 override fun onCancelled(gestureDescription: GestureDescription) {
+                    trace?.reason = "gesture_cancelled"
                     handler.removeCallbacks(timeout); finish(false)
                 }
             }, handler)
-            if (!accepted) { handler.removeCallbacks(timeout); finish(false) }
+            if (!accepted) { trace?.reason = "dispatch_rejected"; handler.removeCallbacks(timeout); finish(false) }
         } catch (_: RuntimeException) {
+            trace?.reason = "native_exception"
             handler.removeCallbacks(timeout); finish(false)
         }
     }
@@ -394,6 +512,10 @@ class AgentAccessibilityService : AccessibilityService() {
             }
 
             if (editNode != null) {
+                val trace = UiActionTrace.current.get()
+                if (trace != null && !editNode.isPassword) DiagnosticTrace.append(this, trace.task, "input_request", mapOf("step" to trace.step, "characters" to text.length))
+                trace?.resolved(editNode, "accessibility_set_text")
+                trace?.beforeDispatch()
                 editNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
                 val args = Bundle()
                 args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
@@ -403,6 +525,7 @@ class AgentAccessibilityService : AccessibilityService() {
             }
             root.recycle()
         }
+        UiActionTrace.current.get()?.reason = "not_found"
         return false
     }
 
@@ -464,7 +587,7 @@ class AgentAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         hint: String?
     ): AccessibilityNodeInfo? {
-        if (node.isEditable) {
+        if (node.isVisibleToUser && node.isEnabled && UiControlSemantics.textInput(node)) {
             if (hint == null) return node
             val text = node.text?.toString() ?: ""
             val desc = node.contentDescription?.toString() ?: ""

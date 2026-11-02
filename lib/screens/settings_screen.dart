@@ -8,6 +8,7 @@ import '../services/screen_automation_service.dart';
 import '../services/telegram_service.dart';
 import 'task_history_screen.dart';
 import 'app_memory_screen.dart';
+import 'diagnostic_trace_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../config/feature_flags.dart';
@@ -808,6 +809,20 @@ class _SettingsScreenState extends State<SettingsScreen>
               subtitle: const Text('Inspect lessons or add a navigation note'),
               trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
               onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AppMemoryScreen())),
+            )],
+          ),
+
+          _buildSettingsCard(
+            icon: Icons.bug_report_outlined,
+            title: 'UI diagnostics',
+            subtitle: 'Bounded, redacted control trace',
+            isDark: isDark,
+            children: [ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Manage diagnostic trace'),
+              subtitle: const Text('Enable, export or clear local diagnostics'),
+              trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const DiagnosticTraceScreen())),
             )],
           ),
 

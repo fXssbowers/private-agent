@@ -12,6 +12,8 @@ import '../models/app_memory_context.dart';
 import '../models/saved_skill.dart';
 import '../models/task_result.dart';
 import 'task_progress_guard.dart';
+import 'diagnostic_trace_service.dart';
+import '../models/ui_interaction_result.dart';
 
 /// Executes multi-step UI automation tasks using LLM-guided screen reading.
 ///
@@ -91,7 +93,9 @@ Rules:
 - ALWAYS use the text dump to decide your next action.
 - If click_text/click_at is accepted but repeatedly does not select the intended control, try tap_at on that control as a different physical strategy. Acknowledged accessible clicks and physical touches are not equivalent. Never tap the TV keyboard; close it and observe first.
 - If you need to click something, prefer using `click_text`. If the element does not have text, use `click_at` with the coordinates provided in the text dump.
-- Click a search field before typing on the next observation. The executor already waits after each action; use wait only when content is visibly loading.
+- type_text already focuses the editable control before setting text. If an editable field is visible, type_text directly; do not click a search/microphone icon first merely to show the keyboard. A voice-related hint in an editable field still permits TEXT input.
+- Voice controls marked [voice] are not text search controls. Do not activate voice recognition unless the ORIGINAL user explicitly requested app voice input. If the app starts voice automatically on entering search, dismiss an active recognizer dialog with one press_back and observe before focusing/typing into the editable field; do not abandon text search just because voice started.
+- A wrong control, rejected action or query that did not stick is an INTERACTION failure, not proof the strategy is wrong. Retain the strategy/subgoal and try another appropriate control/input method in the same search flow. Use strategy replanning only after distinct local attempts are exhausted or a repeated closed cycle is observed. The executor already waits after each action; wait only for visible loading.
 - After typing a search query, use press_enter at most once. It is unsupported on Android TV because it can type the focused keyboard letter. If rejected, keep the query and activate the application's explicit search/submit control: look for a clickable Button inside or next to the editable field, even if it has no text. Do not retry Enter or press a letter key. Dismiss the keyboard with press_back only if it is visibly open.
 - Continue a useful navigation sequence across different observed states, including repeated use of the same navigation key. Change route when observations show a cycle or repeated rejection. Consider global navigation actions as well as visible app controls.
 - completion_evidence is a top-level JSON string for done, separate from reasoning and params. A formatting repair does not require changing the successful navigation route.
@@ -126,12 +130,40 @@ Rules:
   }
 
   /// Execute a multi-step task with LLM guidance
-  Future<TaskResult> executeTask(String userGoal) async {
-    await ScreenAutomationService.logToNative(
-      "[TaskExecutor] executeTask() CALLED with goal: $userGoal",
-    );
+  Future<TaskResult> executeTask(
+    String userGoal, {
+    String? trustedUserRequest,
+  }) async {
     _cancelled = false;
+    final diagnostic = DiagnosticSession();
+    await diagnostic.start();
+    TaskResult? result;
+    try {
+      if (_cancelled) {
+        result = const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
+        return result;
+      }
+      result = await _executeTask(
+        userGoal,
+        diagnostic,
+        AppVoicePolicy.allows(trustedUserRequest),
+      );
+      return result;
+    } finally {
+      await diagnostic.event('task_end', {
+        'status': result?.status.name ?? 'failed',
+      });
+    }
+  }
 
+  Future<TaskResult> _executeTask(
+    String userGoal,
+    DiagnosticSession diagnostic,
+    bool voiceAllowed,
+  ) async {
+    await ScreenAutomationService.logToNative(
+      "[TaskExecutor] executeTask() CALLED",
+    );
     await ScreenAutomationService.logToNative(
       "[TaskExecutor] Checking if accessibility service is running...",
     );
@@ -163,6 +195,8 @@ Rules:
     int consecutiveFailures = 0;
     String lastFailedAction = '';
     int totalTokens = 0;
+    String? expectedTypedValue;
+    String? expectedTypedControl;
 
     if (shortcut != null && shortcut.isNotEmpty) {
       results.add('Using navigation shortcut: ${shortcut.length} steps');
@@ -178,7 +212,13 @@ Rules:
           await Future.delayed(const Duration(milliseconds: 3000));
         } else if (step.action == 'click_text') {
           final text = step.params['text'] as String? ?? '';
-          success = await _screenService.clickByText(text);
+          success = (await _screenService.performInteraction(
+            'click_text',
+            {'text': text},
+            taskId: diagnostic.id,
+            step: 0,
+            voiceAllowed: voiceAllowed,
+          )).accepted;
           await Future.delayed(const Duration(milliseconds: 1500));
         }
 
@@ -239,10 +279,7 @@ Rules:
       final screenContent = _aiService.useScreenCompression
           ? await _screenService.getCompressedScreenDescription(userGoal)
           : await _screenService.getScreenDescription();
-      developer.log(
-        '=== SCREEN DUMP (Step ${step + 1}) ===\n$screenContent',
-        name: 'PrivateAgent',
-      );
+      developer.log('Read screen for step ${step + 1}', name: 'PrivateAgent');
 
       final package = await _screenService.getCurrentPackage();
       final version = package == null
@@ -255,6 +292,53 @@ Rules:
       );
       final appMemoryHint = await memory.observe(memoryContext);
       progressGuard.observe(screenContent);
+      progressGuard.recoveryDecision();
+      if (expectedTypedValue != null && expectedTypedValue.length <= 50) {
+        final editable = screenContent
+            .split('\n')
+            .where((line) => RegExp(r'\b(edit|editable)\b').hasMatch(line));
+        if (editable.isNotEmpty) {
+          final matches = editable.any(
+            (line) => line.contains('"$expectedTypedValue"'),
+          );
+          await diagnostic.event('query_check', {
+            'step': step + 1,
+            'readback_matches': matches,
+            'reason': matches ? 'query_confirmed' : 'query_mismatch',
+          });
+          if (matches) {
+            progressGuard.interactionRecovered();
+            expectedTypedValue = null;
+            expectedTypedControl = null;
+          } else {
+            progressGuard.requireLocalRepair(
+              expectedTypedControl ?? 'typed_field',
+            );
+          }
+        }
+      }
+      await diagnostic.event('observation', {
+        'step': step + 1,
+        'screen': progressGuard.currentState,
+        'package': package,
+        'controls': screenContent
+            .split('\n')
+            .where(
+              (line) => line.contains('[tap') || line.contains('clickable'),
+            )
+            .length,
+        'editable': screenContent
+            .split('\n')
+            .where((line) => RegExp(r'\b(edit|editable)\b').hasMatch(line))
+            .length,
+        'voice_controls': screenContent
+            .split('\n')
+            .where((line) => line.contains('voice'))
+            .length,
+        'keyboard_open': screenContent.contains('keyboard open'),
+        'plan_revision': progressGuard.planRevision,
+        'local_failures': progressGuard.localFailures,
+      });
       // Determine previous result string
       final prevResultStr = step > 0 && results.isNotEmpty
           ? '\nPREVIOUS ACTION RESULT: ${results.last}\n'
@@ -264,7 +348,7 @@ Rules:
       String failureHint = '';
       if (consecutiveFailures >= 3) {
         failureHint =
-            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. You MUST try a completely different action. If open_app failed, try press_home and look for the app icon on the home screen instead. If click_text failed, use click_at with coordinates. Do NOT repeat the same failed action.';
+            '\n\nWARNING: You have failed $consecutiveFailures times in a row with the same approach. Repair the interaction using another suitable control or input method while retaining a useful strategy. If open_app failed, try press_home and look for the app icon on the home screen instead. If click_text failed, use click_at with coordinates. Do NOT repeat the same failed action.';
       }
 
       // 2. Build the prompt (system prompt is sent separately via sendTaskMessage)
@@ -278,10 +362,11 @@ ${progressGuard.context}
 $appMemoryHint
 Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. What is the next action?''';
 
-      developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
+      developer.log('Prepared task prompt', name: 'PrivateAgent');
 
       // 3. Get AI response — races against cancel signal so Stop works immediately
       String response;
+      final modelTimer = Stopwatch()..start();
       try {
         _cancelCompleter = Completer<void>();
         final aiFuture = _aiService.sendTaskMessage(_taskSystemPrompt, prompt);
@@ -311,13 +396,15 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         }
 
         final aiResponse = result as AiResponse;
+        await diagnostic.event('model_response', {
+          'step': step + 1,
+          'duration_ms': modelTimer.elapsedMilliseconds,
+          'tokens': aiResponse.totalTokens,
+        });
         response = aiResponse.content;
         totalTokens += aiResponse.totalTokens;
 
-        developer.log(
-          '=== RAW AI RESPONSE ===\n$response',
-          name: 'PrivateAgent',
-        );
+        developer.log('Received task decision', name: 'PrivateAgent');
       } catch (e) {
         if (_cancelled) {
           results.add('Task cancelled by user.');
@@ -337,6 +424,10 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           await Future.delayed(const Duration(seconds: 2));
           return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
         }
+        await diagnostic.event('model_error', {
+          'step': step + 1,
+          'reason': e is TimeoutException ? 'timeout' : 'connection_error',
+        });
         results.add('AI error: $e');
         _report('Error: $e');
         await _notificationService.showTaskCompleteNotification(
@@ -387,7 +478,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       } catch (firstError) {
         // First attempt failed — retry once
         developer.log(
-          '=== JSON PARSE FAILED, RETRYING ===\nError: $firstError\nRaw: $response',
+          'Task decision formatting failed; retrying',
           name: 'PrivateAgent',
         );
         _report('Retrying step ${step + 1}...\n(Failed to parse: $firstError)');
@@ -420,10 +511,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
             return const TaskResult(TaskStatus.cancelled, 'Task cancelled.');
           }
           totalTokens += retryResponse.totalTokens;
-          developer.log(
-            '=== RETRY AI RESPONSE ===\n${retryResponse.content}',
-            name: 'PrivateAgent',
-          );
+          developer.log('Received formatting retry', name: 'PrivateAgent');
 
           String jsonStr = _extractJson(retryResponse.content);
           actionJson = jsonDecode(jsonStr) as Map<String, dynamic>;
@@ -468,13 +556,32 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       final reasoning = actionJson['reasoning'] as String? ?? '';
       final isComplete = action == 'done';
 
-      developer.log(
-        '=== PARSED ACTION ===\nAction: $action\nParams: $params\nReasoning: $reasoning\nIs Complete: $isComplete',
-        name: 'PrivateAgent',
-      );
+      developer.log('Parsed task decision', name: 'PrivateAgent');
 
       _report('Step ${step + 1}: $reasoning');
+      await diagnostic.event('decision', {
+        'step': step + 1,
+        'action': action,
+        'plan_revision': progressGuard.planRevision,
+      });
+      if ((action == 'replan' || action == 'failed') &&
+          progressGuard.deferStrategyChange) {
+        results.add(
+          'Local interaction repair required: keep the current strategy/subgoal. Try another appropriate control or input method; a wrong click is not a failed search strategy.',
+        );
+        await diagnostic.event('plan_change', {
+          'step': step + 1,
+          'reason': 'early_replan_deferred',
+          'status': 'local_repair',
+        });
+        continue;
+      }
       if (action == 'replan') {
+        await diagnostic.event('plan_change', {
+          'step': step + 1,
+          'reason': 'model_replan',
+          'status': 'strategy_replan',
+        });
         progressGuard.abandon(reasoning);
         progressGuard.adoptPlan(actionJson['plan']);
         results.add('Replanning from the actual current screen: $reasoning');
@@ -495,7 +602,16 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       if (loopRejection != null) {
         results.add(loopRejection);
         _report(loopRejection);
-        progressGuard.abandon(loopRejection);
+        if (progressGuard.needsReplan) progressGuard.abandon(loopRejection);
+        await diagnostic.event('plan_change', {
+          'step': step + 1,
+          'reason': progressGuard.needsReplan
+              ? 'cycle_detected'
+              : 'ineffective_control',
+          'status': progressGuard.needsReplan
+              ? 'strategy_replan'
+              : 'local_repair',
+        });
         // No UI action ran. The next decision starts from the same real screen.
         continue;
       }
@@ -506,10 +622,25 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       bool success = false;
       String actionResult = '';
 
+      UiInteractionResult? interaction;
+      if (const {
+        'click_text',
+        'click_at',
+        'tap_at',
+        'type_text',
+      }.contains(action)) {
+        interaction = await _screenService.performInteraction(
+          action,
+          params,
+          taskId: diagnostic.id,
+          step: step + 1,
+          voiceAllowed: voiceAllowed,
+        );
+      }
       switch (action) {
         case 'click_text':
           final text = params['text'] as String? ?? '';
-          success = await _screenService.clickByText(text);
+          success = interaction!.accepted;
           actionResult = success
               ? 'Clicked "$text"'
               : 'Could not find "$text" to click';
@@ -518,14 +649,14 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         case 'click_at':
           final x = (params['x'] as num?)?.toDouble() ?? 0;
           final y = (params['y'] as num?)?.toDouble() ?? 0;
-          success = await _screenService.clickAt(x, y);
+          success = interaction!.accepted;
           actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
           break;
 
         case 'tap_at':
           final x = (params['x'] as num?)?.toDouble() ?? double.nan;
           final y = (params['y'] as num?)?.toDouble() ?? double.nan;
-          success = directTouchAvailable && await _screenService.tapAt(x, y);
+          success = interaction!.accepted;
           actionResult = success
               ? 'Touched at ($x, $y)'
               : 'Direct touch rejected (display support, coordinates or TV keyboard)';
@@ -533,8 +664,8 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
 
         case 'type_text':
           final text = params['text'] as String? ?? '';
-          final hint = params['field_hint'] as String?;
-          success = await _screenService.typeText(text, fieldHint: hint);
+          success = interaction!.accepted;
+          if (success) expectedTypedValue = text;
           actionResult = success ? 'Typed "$text"' : 'Could not type text';
           break;
 
@@ -615,6 +746,12 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
                 'Completion not accepted: $problem. '
                 'If the FULL goal is visible, reply with {"action":"done","completion_evidence":"<exact visible text>","reasoning":"<why it proves the full goal>"}. '
                 'Otherwise verify the result from the actual screen. Keep the current plan; do not navigate away merely to repair JSON. A selected listing is not playback.';
+            await diagnostic.event('completion_rejected', {
+              'step': step + 1,
+              'reason': evidence is String
+                  ? 'completion_evidence_mismatch'
+                  : 'completion_evidence_missing',
+            });
             results.add(actionResult);
             _report(actionResult);
             continue;
@@ -643,12 +780,37 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           actionResult = 'Unknown action: $action';
       }
 
+      final controlKey = interaction == null
+          ? null
+          : interaction.controlKey.isNotEmpty
+          ? interaction.controlKey
+          : action == 'type_text'
+          ? 'typed_field'
+          : '$action:${jsonEncode(params)}';
+      if (action == 'type_text' && success) expectedTypedControl = controlKey;
+      if (interaction != null && !success) {
+        progressGuard.requireLocalRepair(controlKey ?? '');
+        if (interaction.reason == 'voice_control_blocked') {
+          actionResult =
+              'Voice control blocked: the original user did not request app voice input. Keep the text-search strategy; use the editable field directly.';
+        }
+      }
+      await diagnostic.event('action_result', {
+        'step': step + 1,
+        'action': action,
+        'accepted': success,
+        'reason':
+            interaction?.reason ?? (success ? 'accepted' : 'native_rejected'),
+      });
       memory.record(memoryContext, action, params, success);
-      progressGuard.recordAttempt(action, params, success, actionResult);
-      developer.log(
-        '=== NATIVE EXECUTION RESULT ===\n$actionResult',
-        name: 'PrivateAgent',
+      progressGuard.recordAttempt(
+        action,
+        params,
+        success,
+        actionResult,
+        controlKey: controlKey,
       );
+      developer.log('Native action returned', name: 'PrivateAgent');
 
       // Track consecutive failures to detect stuck loops
       if (!success) {
@@ -660,7 +822,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
         }
 
         if (consecutiveFailures >= 3) {
-          progressGuard.abandon('Repeated native action rejection.');
+          progressGuard.requireLocalRepair('');
           consecutiveFailures = 0;
           lastFailedAction = '';
         }
