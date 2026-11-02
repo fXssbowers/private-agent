@@ -15,6 +15,32 @@ the same observed screen is blocked, including across intervening screens or wai
 three blocked proposals stop the task. The model can choose another visible route
 within the existing step limit. Saved actions require fresh screen verification.
 
+Persistent app memory stores contextual navigation lessons in the app's private
+`app_memory/<package>.json` files: at most 8 KiB per app and 64 KiB total, measured
+as UTF-8 bytes, including a staging copy during replacement. Older observations
+and app files are pruned at the limits. Five relevant notes at most accompany a
+step; app-version changes fence off old lessons. Memory does not add AI requests.
+Observed lessons use control-layout fingerprints and navigation outcomes, never
+raw screen dumps, movie/channel titles or typed queries. Text-based learning is limited to known navigation labels such as Search/Back;
+content titles are never learned as text targets. An accepted click
+or changed layout is not evidence that the user's goal succeeded.
+
+Settings → App memory lets users inspect lessons, add conditional navigation advice
+and clear one app's notes, including notes from a previous app version. User-entered advice is kept distinct from observed
+transitions and still requires checking the visible screen. User advice can be
+scoped to search/text entry, navigation menus, other screens or any screen.
+Matching observed evidence retains a prompt slot even when many user hints exist. Old goal-matched
+`skills_memory.jsonl` macros are retained unchanged for rollback, but are neither
+replayed nor expanded. Recent task history is capped at 128 KiB and 50 records,
+with bounded traces; its statistics describe retained tasks, not lifetime totals.
+
+Storage serializes same-process Flutter engines with exclusive lock-file creation
+and synchronous small transactions. The app's Android components run in one OS
+process. A full app restart recovers abandoned locks from the prior process; a busy
+lock is never stolen from a live engine. File/storage failures disable learning for
+that observation without changing the task outcome. App memory is a hint, not an
+input capability: TiviMate navigation still needs real-device validation.
+
 The tested configuration uses the Custom provider, base URL
 `https://api.openai.com/v1`, model `gpt-6.1-terra`, and a 4096-token response limit.
 The Terra payload adaptation is restricted to that exact provider/model pair.

@@ -236,6 +236,15 @@ class ScreenAutomationService {
     return screenString;
   }
 
+  /// Versions fence persistent lessons from an application's later UI updates.
+  Future<String?> getAppVersion(String packageName) async {
+    try {
+      return await _invoke<String>('getAppVersion', {'packageName': packageName});
+    } catch (_) {
+      return null; // Unknown versions cannot safely reuse or create lessons.
+    }
+  }
+
   /// Click an element by its visible text
   Future<bool> clickByText(String text) async {
     try {

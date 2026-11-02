@@ -99,6 +99,17 @@ class MainActivity : FlutterActivity() {
                             }
                         }
 
+                        "getAppVersion" -> {
+                            val packageName = call.argument<String>("packageName") ?: ""
+                            try {
+                                val info = context.packageManager.getPackageInfo(packageName, 0)
+                                val code = if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+                                result.success("${info.versionName}:$code")
+                            } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
+                                result.success(null)
+                            }
+                        }
+
                         "takeScreenshot" -> {
                             val service = AgentAccessibilityService.instance
                             if (service == null) {

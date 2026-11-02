@@ -86,7 +86,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Task History (${_history.length})'),
+        title: Text('Recent task history (${_history.length})'),
         actions: [
           IconButton(
             icon: const Icon(Icons.delete),
@@ -109,7 +109,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
                             child: Row(
                               mainAxisAlignment: MainAxisAlignment.spaceAround,
                               children: [
-                                _buildStatColumn('Total', _analytics!['totalTasks'].toString(), isDark: Theme.of(context).brightness == Brightness.dark),
+                                _buildStatColumn('Recent', _analytics!['totalTasks'].toString(), isDark: Theme.of(context).brightness == Brightness.dark),
                                 _buildStatColumn('Success', _analytics!['successCount'].toString(), color: Colors.green, isDark: Theme.of(context).brightness == Brightness.dark),
                                 _buildStatColumn('Failed', _analytics!['failedCount'].toString(), color: Colors.red, isDark: Theme.of(context).brightness == Brightness.dark),
                                 _buildStatColumn('Rate', '${(_analytics!['successRate'] * 100).toStringAsFixed(1)}%', isDark: Theme.of(context).brightness == Brightness.dark),
@@ -203,7 +203,7 @@ class _TaskHistoryScreenState extends State<TaskHistoryScreen> {
                                       ),
                                       const SizedBox(height: 20),
                                       const Text(
-                                        'Execution Trace:',
+                                        'Execution trace (recent steps):',
                                         style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                                       ),
                                       const SizedBox(height: 8),

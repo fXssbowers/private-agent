@@ -12,6 +12,7 @@ import 'package:private_agent/services/screen_automation_service.dart';
 import 'package:private_agent/services/shizuku_service.dart';
 import 'package:private_agent/services/task_executor.dart';
 import 'package:private_agent/services/task_progress_guard.dart';
+import 'package:private_agent/services/app_memory_service.dart';
 
 class Screen extends ScreenAutomationService {
   bool running = true;
@@ -20,6 +21,8 @@ class Screen extends ScreenAutomationService {
   int clicks = 0;
   @override
   Future<bool> isServiceRunning() async => running;
+  @override
+  Future<String?> getAppVersion(String packageName) async => '1';
   @override
   Future<String?> getCurrentPackage() async => 'fixture.app';
   @override
@@ -67,6 +70,12 @@ class CyclingScreen extends Screen {
     }
     return true;
   }
+}
+
+class MemoryScreen extends Screen {
+  @override
+  Future<String> getCompressedScreenDescription(String task) async =>
+      'APP: fixture.app\n[0] view "" [tap] center:(960,540)\n[1] btn "Cerca" [tap] center:(100,100)';
 }
 
 class Notices extends NotificationService {
@@ -339,6 +348,47 @@ void main() {
       expect(ai.prompts.last, contains('requested search result'));
     },
   );
+  test(
+    'a fresh executor receives a prior failed navigation lesson without replay',
+    () async {
+      final screen = MemoryScreen()..acceptsClick = false;
+      final first = Model([
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"failed","reasoning":"No alternative visible"}',
+      ]);
+      expect(
+        (await executor(first, screen).executeTask('search')).success,
+        false,
+      );
+      final second = Model([
+        '{"action":"failed","reasoning":"Try a different route"}',
+      ]);
+      await executor(second, MemoryScreen()).executeTask('search another film');
+      expect(
+        second.prompts.single,
+        contains('APP MEMORY (fixture.app, version 1)'),
+      );
+      expect(second.prompts.single, contains('"last_outcome":"rejected"'));
+      expect(second.calls, 1);
+      expect(screen.clicks, 1);
+    },
+  );
+  test('explicit user advice is included as conditional app context', () async {
+    await AppMemoryService().saveUserLesson(
+      'fixture.app',
+      '1',
+      when: 'Player, keyboard closed',
+      advice: 'Use Back',
+      expected: 'Channel menu',
+    );
+    final ai = Model([
+      '{"action":"failed","reasoning":"Need to inspect menu"}',
+    ]);
+    await executor(ai, MemoryScreen()).executeTask('search');
+    expect(ai.prompts.single, contains('Use Back'));
+    expect(ai.prompts.single, contains('"source":"user"'));
+    expect(ai.prompts.single, contains('only when its context matches'));
+  });
   test('cancellation while waiting for AI propagates cancellation', () async {
     final ai = Model([])..pending = Completer<AiResponse>();
     final runner = executor(ai, Screen());
@@ -366,14 +416,20 @@ void main() {
     },
   );
   test(
-    'saved actions must verify current screen before claiming success',
+    'legacy saved macros are preserved but never replayed automatically',
     () async {
       await File('${directory.path}/skills_memory.jsonl').writeAsString(
         '{"id":"fixture","task":"search","task_keywords":["search"],"success_count":1,"fail_count":0,"last_used":"2026-11-01T00:00:00","steps":[{"action":"click_at","params":{"x":50,"y":50}}]}\n',
       );
       final ai = Model(['{"action":"failed","reasoning":"Wrong film"}']);
-      final result = await executor(ai, Screen()).executeTask('search');
+      final screen = Screen();
+      final result = await executor(ai, screen).executeTask('search');
       expect(ai.calls, 1);
+      expect(screen.clicks, 0);
+      expect(
+        await File('${directory.path}/skills_memory.jsonl').exists(),
+        true,
+      );
       expect(result.success, false);
     },
   );

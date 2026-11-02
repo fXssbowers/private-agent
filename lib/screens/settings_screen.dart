@@ -7,6 +7,7 @@ import '../services/shizuku_service.dart';
 import '../services/screen_automation_service.dart';
 import '../services/telegram_service.dart';
 import 'task_history_screen.dart';
+import 'app_memory_screen.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_overlay_window/flutter_overlay_window.dart';
 import '../config/feature_flags.dart';
@@ -796,18 +797,32 @@ class _SettingsScreenState extends State<SettingsScreen>
             children: _buildPermissionTiles(),
           ),
 
+          _buildSettingsCard(
+            icon: Icons.psychology_outlined,
+            title: 'App memory',
+            subtitle: 'Learned navigation and your advice, with limited storage',
+            isDark: isDark,
+            children: [ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Manage app memory'),
+              subtitle: const Text('Inspect lessons or add a navigation note'),
+              trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AppMemoryScreen())),
+            )],
+          ),
+
           // 8. Task History Card
           _buildSettingsCard(
             icon: Icons.history_outlined,
             title: 'Execution logs',
-            subtitle: 'View history of tasks and token analytics',
+            subtitle: 'View recent tasks and token analytics',
             isDark: isDark,
             children: [
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('View Task History'),
                 subtitle: const Text(
-                  'Access complete trace of execution steps',
+                  'Access recent execution steps',
                 ),
                 trailing: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
                 onTap: () {

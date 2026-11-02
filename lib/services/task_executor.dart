@@ -7,7 +7,8 @@ import 'app_launcher_service.dart';
 import 'notification_service.dart';
 import 'task_history_logger.dart';
 import 'shizuku_service.dart';
-import 'skill_memory_service.dart';
+import 'app_memory_service.dart';
+import '../models/app_memory_context.dart';
 import '../models/saved_skill.dart';
 import '../models/task_result.dart';
 import 'task_progress_guard.dart';
@@ -22,7 +23,8 @@ class TaskExecutor {
   final AppLauncherService _appLauncher;
   final ShizukuService _shizukuService;
   final NotificationService _notificationService;
-  final SkillMemoryService _skillMemory = SkillMemoryService();
+
+  final AppMemoryService _appMemory;
 
   /// Callback to report progress messages to the UI
   final void Function(String message)? onProgress;
@@ -38,11 +40,13 @@ class TaskExecutor {
     required ShizukuService shizukuService,
     this.onProgress,
     NotificationService? notificationService,
+    AppMemoryService? appMemoryService,
   }) : _aiService = aiService,
        _screenService = screenService,
        _appLauncher = appLauncher,
        _shizukuService = shizukuService,
-       _notificationService = notificationService ?? NotificationService();
+       _notificationService = notificationService ?? NotificationService(),
+       _appMemory = appMemoryService ?? AppMemoryService();
 
   /// Cancel the currently running task — takes effect immediately
   void cancel() {
@@ -90,6 +94,7 @@ Rules:
 - If you need to find something by scrolling, scroll and then check the screen again.
 - If the requested app cannot be opened, report failed rather than opening an unrelated app.
 - Consult RECENT ATTEMPTS before choosing an action. Screen IDs identify previously observed interfaces. Returning to an earlier screen is not new progress. After two ineffective attempts at the same control or navigation route, choose a different visible control or route. Do not keep alternating guide/player/menu, or re-open the same app to reset your strategy. Repeated actions on the same screen are blocked even across intervening steps. If no alternative exists, use failed and explain the obstacle. Never report done for a failed task.
+- App memory contains contextual evidence or explicit user advice. It never proves the requested goal is complete. Prefer a different visible route when matching past observations show no progress; verify every transition.
 - Keep reasoning very brief (1 sentence)
 ''';
 
@@ -140,37 +145,16 @@ Rules:
     results.add('Starting task: $userGoal');
     _report('Starting task: $userGoal');
 
-    bool replayed = false;
-    final replayedSteps = <ActionStep>[];
-    // Check skill memory first
-    final savedSkill = await _skillMemory.findSkill(userGoal);
-    if (savedSkill != null && savedSkill.isReliable) {
-      _report(
-        'Found saved skill! Replaying ${savedSkill.steps.length} steps...',
-      );
-      final replaySuccess = await _replaySkill(savedSkill, results);
-      if (replaySuccess) {
-        // A replay only performs actions. Verify the current screen with the AI
-        // before announcing success or reinforcing the saved sequence.
-        replayed = true;
-        replayedSteps.addAll(savedSkill.steps);
-        results.add('Saved actions replayed; checking the current screen.');
-        _report('Verifying the result of saved actions...');
-      } else {
-        _report('Replay failed, falling back to AI...');
-        await _skillMemory.recordFailure(savedSkill.id);
-      }
-    }
-
-    // Smart pre-launch shortcuts: execute common sequences without LLM
-    final shortcut = replayed ? null : _getNavigationShortcut(userGoal);
-    String lastAction = replayedSteps.isEmpty ? '' : replayedSteps.last.action;
+    // Persisted app lessons guide observations; old goal-matched macros are
+    // deliberately not replayed. Their original file is retained for rollback.
+    final shortcut = _getNavigationShortcut(userGoal);
+    String lastAction = '';
     final progressGuard = TaskProgressGuard();
+    final memory = TaskMemorySession(_appMemory);
     int sameActionCount = 0;
     int consecutiveFailures = 0;
     String lastFailedAction = '';
     int totalTokens = 0;
-    final List<ActionStep> executedSteps = [...replayedSteps];
 
     if (shortcut != null && shortcut.isNotEmpty) {
       results.add('Using navigation shortcut: ${shortcut.length} steps');
@@ -191,7 +175,6 @@ Rules:
         }
 
         if (success) {
-          executedSteps.add(step);
           lastAction = step.action;
         } else {
           break; // Fall back to AI if shortcut step fails
@@ -251,6 +234,16 @@ Rules:
         name: 'PrivateAgent',
       );
 
+      final package = await _screenService.getCurrentPackage();
+      final version = package == null
+          ? null
+          : await _screenService.getAppVersion(package);
+      final memoryContext = AppMemoryContext.fromScreen(
+        package,
+        version,
+        screenContent,
+      );
+      final appMemoryHint = await memory.observe(memoryContext);
       progressGuard.observe(screenContent);
       if (progressGuard.shouldStop) {
         const message =
@@ -286,6 +279,7 @@ Rules:
 CURRENT SCREEN TEXT DUMP:
 $screenContent$prevResultStr$failureHint
 ${progressGuard.context}
+$appMemoryHint
 Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. What is the next action?''';
 
       developer.log('=== AI PROMPT ===\n$prompt', name: 'PrivateAgent');
@@ -615,9 +609,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
             step,
             results,
           );
-          if (executedSteps.isNotEmpty) {
-            await _skillMemory.saveSkill(userGoal, executedSteps);
-          }
           await _screenService.showToast('Task completed');
           return TaskResult(
             TaskStatus.succeeded,
@@ -628,6 +619,7 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           actionResult = 'Unknown action: $action';
       }
 
+      memory.record(memoryContext, action, params, success);
       progressGuard.recordAttempt(action, params, success, actionResult);
       developer.log(
         '=== NATIVE EXECUTION RESULT ===\n$actionResult',
@@ -676,7 +668,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       } else {
         consecutiveFailures = 0;
         lastFailedAction = '';
-        executedSteps.add(ActionStep(action: action, params: params));
       }
 
       results.add('Step ${step + 1}: $actionResult ($reasoning)');
@@ -741,112 +732,6 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
     return !normalized.contains('not running') &&
         !normalized.contains('permission denied') &&
         !normalized.startsWith('error');
-  }
-
-  /// Replays a saved skill without using the LLM
-  Future<bool> _replaySkill(SavedSkill skill, List<String> results) async {
-    for (int i = 0; i < skill.steps.length; i++) {
-      if (_cancelled) return false;
-
-      final step = skill.steps[i];
-      _report('Replaying step ${i + 1}/${skill.steps.length}: ${step.action}');
-
-      // Delay before executing each step
-      int delay = 1200;
-      if (step.action == 'open_app')
-        delay = 3000;
-      else if (step.action == 'type_text')
-        delay = 2000;
-      else if (step.action == 'click_text' || step.action == 'click_at')
-        delay = 1500;
-      else if (step.action == 'scroll')
-        delay = 1000;
-
-      await Future.delayed(Duration(milliseconds: delay));
-
-      bool success = false;
-      String actionResult = '';
-
-      switch (step.action) {
-        case 'click_text':
-          final text = step.params['text'] as String? ?? '';
-          success = await _screenService.clickByText(text);
-          actionResult = success
-              ? 'Clicked "$text"'
-              : 'Could not find "$text" to click';
-          break;
-        case 'click_at':
-          final x = (step.params['x'] as num?)?.toDouble() ?? 0;
-          final y = (step.params['y'] as num?)?.toDouble() ?? 0;
-          success = await _screenService.clickAt(x, y);
-          actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
-          break;
-        case 'type_text':
-          final text = step.params['text'] as String? ?? '';
-          final hint = step.params['field_hint'] as String?;
-          success = await _screenService.typeText(text, fieldHint: hint);
-          actionResult = success ? 'Typed "$text"' : 'Could not type text';
-          break;
-        case 'press_enter':
-          success = await _screenService.pressEnter();
-          actionResult = success
-              ? 'Submitted the focused search/form field'
-              : 'Could not submit the focused field';
-          break;
-        case 'swipe':
-          final startX = (step.params['startX'] as num?)?.toDouble() ?? 540;
-          final startY = (step.params['startY'] as num?)?.toDouble() ?? 2000;
-          final endX = (step.params['endX'] as num?)?.toDouble() ?? 540;
-          final endY = (step.params['endY'] as num?)?.toDouble() ?? 500;
-          success = await _performSwipe(startX, startY, endX, endY);
-          actionResult = 'Swiped from ($startX,$startY) to ($endX,$endY)';
-          break;
-        case 'scroll':
-          final direction = step.params['direction'] as String? ?? 'down';
-          success = await _performScroll(direction);
-          actionResult = success
-              ? 'Scrolled $direction'
-              : 'Could not scroll $direction';
-          break;
-        case 'press_back':
-          success = await _screenService.pressBack();
-          actionResult = 'Pressed back';
-          break;
-        case 'press_home':
-          success = await _screenService.pressHome();
-          actionResult = 'Pressed home';
-          break;
-        case 'open_app':
-          final appName = step.params['app_name'] as String? ?? '';
-          actionResult = await _appLauncher.openApp(appName);
-          success = actionResult.startsWith('Opened');
-          break;
-        case 'wait':
-          await Future.delayed(const Duration(seconds: 1));
-          actionResult = 'Waited';
-          success = true;
-          break;
-        case 'done':
-          success = true;
-          actionResult = 'Done step reached';
-          break;
-        default:
-          success = false;
-          actionResult = 'Unknown action: ${step.action}';
-      }
-
-      results.add('Memory Replay Step ${i + 1}: $actionResult');
-      developer.log(
-        '=== MEMORY REPLAY RESULT ===\n$actionResult',
-        name: 'PrivateAgent',
-      );
-
-      if (!success) {
-        return false; // Break out of replay if a step fails
-      }
-    }
-
-    return true; // All steps succeeded
   }
 
   /// Returns predefined navigation steps for common tasks
