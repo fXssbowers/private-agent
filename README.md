@@ -8,18 +8,29 @@ PrivateAgent is an open-source Android automation agent built with Flutter. It u
 The `codex/android-tv-controls` branch adds experimental TV control fixes:
 accessible controls are activated before touch gestures; gestures report their
 completion or cancellation; generic Enter and direct keyboard-key interaction are rejected on TV to prevent focused-letter insertion; searches use explicit application submit controls;
-application results take priority over keyboard suggestions. Failed, cancelled,
-and step-limited tasks remain failures in the chat. Task-local screen/action history
-lets the model recognize repeated navigation routes. A third identical action on
-the same observed screen is blocked, including across intervening screens or waits;
-three blocked proposals stop the task. The model can choose another visible route
-within the existing step limit. Saved actions require fresh screen verification.
+application results take priority over keyboard suggestions. The explicit `tap_at`
+action sends a physical touch when an acknowledged accessible click does not
+select the control. It retains coordinate checks, gesture completion reporting and
+the TV keyboard guard; it does not use Enter, Shizuku or root. Display touch
+support is checked separately from accessibility permission and reported to the
+planner. On this Android 11 TCL, the display is configured without touch: physical
+gesture injection was rejected in native tests, so `tap_at` is unavailable here.
+This remains a control limitation; planning or memory cannot create the missing
+input capability. Failed, cancelled,
+and step-limited tasks remain failures in the chat. A compact task-local plan
+keeps a strategy, subgoal and up to three alternatives across observations.
+The controller records real transitions and replans a stalled branch without
+pretending that the UI has been restored. Two ineffective attempts at the same
+state/control are blocked; two identical closed navigation cycles require another
+route. Shared navigation corridors and repeated keys in different states remain
+available. Planning and blocked proposals consume the same budget (default 60
+decisions, configurable); Stop remains available. Completion must cite text from
+the current screen, but still requires independent destination verification.
 
 Persistent app memory stores contextual navigation lessons in the app's private
 `app_memory/<package>.json` files: at most 8 KiB per app and 64 KiB total, measured
 as UTF-8 bytes, including a staging copy during replacement. Older observations
-and app files are pruned at the limits. Five relevant notes at most accompany a
-step; app-version changes fence off old lessons. Memory does not add AI requests.
+and app files are pruned at the limits. All pertinent notes accompany a step within an 8 KiB serialized payload; app-version changes fence off old lessons. Memory does not add AI requests.
 Observed lessons use control-layout fingerprints and navigation outcomes, never
 raw screen dumps, movie/channel titles or typed queries. Text-based learning is limited to known navigation labels such as Search/Back;
 content titles are never learned as text targets. An accepted click
@@ -29,7 +40,18 @@ Settings → App memory lets users inspect lessons, add conditional navigation a
 and clear one app's notes, including notes from a previous app version. User-entered advice is kept distinct from observed
 transitions and still requires checking the visible screen. User advice can be
 scoped to search/text entry, navigation menus, other screens or any screen.
-Matching observed evidence retains a prompt slot even when many user hints exist. Old goal-matched
+Short observed navigation prefixes may be saved after screen-grounded,
+model-reported completion. Their provenance does not claim independent task
+verification. Each step includes structural preconditions and an observed result;
+check the actual screen before every action. Prefixes stop before typed content,
+content-title clicks or coordinate interaction, and are never replayed automatically.
+
+The App memory screen can start a temporary, initially empty learning session for
+main-app tasks. It ignores all normal saved hints and observations, shares only
+new learning across main-app chats, and discards that learning when ended or when
+the process restarts. Original saved files are preserved. The separate floating
+assistant engine uses normal memory. Start a new chat as well for a clean trial.
+Old goal-matched
 `skills_memory.jsonl` macros are retained unchanged for rollback, but are neither
 replayed nor expanded. Recent task history is capped at 128 KiB and 50 records,
 with bounded traces; its statistics describe retained tasks, not lifetime totals.
@@ -39,7 +61,8 @@ and synchronous small transactions. The app's Android components run in one OS
 process. A full app restart recovers abandoned locks from the prior process; a busy
 lock is never stolen from a live engine. File/storage failures disable learning for
 that observation without changing the task outcome. App memory is a hint, not an
-input capability: TiviMate navigation still needs real-device validation.
+input capability: each full task still needs real-device validation. Design evidence
+and its limits are documented in [the research note](docs/research/adaptive-ui-exploration.md).
 
 The tested configuration uses the Custom provider, base URL
 `https://api.openai.com/v1`, model `gpt-6.1-terra`, and a 4096-token response limit.

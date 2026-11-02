@@ -19,6 +19,16 @@ class Screen extends ScreenAutomationService {
   bool acceptsClick = true;
   int backs = 0;
   int clicks = 0;
+  int touches = 0;
+  bool touchSupported = true;
+  @override
+  Future<bool> canDispatchTouch() async => touchSupported;
+  @override
+  Future<bool> tapAt(double x, double y) async {
+    touches++;
+    return true;
+  }
+
   @override
   Future<bool> isServiceRunning() async => running;
   @override
@@ -160,6 +170,9 @@ void main() {
   test('waits and app reopening cannot erase unsuccessful attempts', () {
     final guard = TaskProgressGuard()..observe('guide');
     guard.recordAttempt('click_text', {'text': 'Guide'}, true, 'Accepted');
+    guard.observe('guide');
+    guard.recordAttempt('click_text', {'text': 'Guide'}, true, 'Accepted');
+    guard.observe('guide');
     guard.recordAttempt('wait', {}, true, 'Waited');
     guard.observe('home');
     guard.recordAttempt('open_app', {'app_name': 'TiviMate'}, true, 'Opened');
@@ -318,11 +331,12 @@ void main() {
           5,
           (_) => '{"action":"click_at","params":{"x":50,"y":50}}',
         ),
+        limit: 5,
       );
       final screen = Screen();
       final result = await executor(ai, screen).executeTask('search');
       expect(result.status, TaskStatus.failed);
-      expect(result.message, contains('blocked strategies'));
+      expect(result.message, contains('allowed steps'));
       expect(ai.calls, 5);
       expect(screen.clicks, 2);
       expect(ai.prompts[2], contains('STRATEGY CHANGE REQUIRED'));
@@ -335,7 +349,7 @@ void main() {
       final ai = Model([
         ...List.filled(5, '{"action":"click_at","params":{"x":10,"y":50}}'),
         '{"action":"click_at","params":{"x":20,"y":50}}',
-        '{"action":"done","reasoning":"Requested search result visible"}',
+        '{"action":"done","reasoning":"Requested search result visible","completion_evidence":"requested search result"}',
       ]);
       final screen = CyclingScreen();
       final result = await executor(ai, screen).executeTask('search');
@@ -433,9 +447,147 @@ void main() {
       expect(result.success, false);
     },
   );
+  test(
+    'a branch failure tries a remaining approach without moving the device',
+    () async {
+      final ai = Model([
+        '{"action":"replan","plan":{"strategy":"visible controls","subgoal":"find search","alternatives":["global navigation"]}}',
+        '{"action":"failed","reasoning":"This branch is exhausted"}',
+        '{"action":"done","completion_evidence":"Interstellar 2014","reasoning":"Result visible"}',
+      ]);
+      final screen = Screen();
+      expect((await executor(ai, screen).executeTask('search')).success, true);
+      expect(ai.calls, 3);
+      expect(screen.backs, 0);
+      expect(ai.prompts.last, contains('global navigation'));
+      expect(ai.prompts.last, contains('ABANDONED STRATEGIES'));
+    },
+  );
+  test(
+    'unsupported completion evidence consumes budget and cannot report success',
+    () async {
+      final ai = Model([
+        '{"action":"done","completion_evidence":"Film is playing"}',
+        '{"action":"done"}',
+      ], limit: 2);
+      expect(
+        (await executor(ai, Screen()).executeTask('play')).status,
+        TaskStatus.failed,
+      );
+      expect(ai.calls, 2);
+      expect(ai.prompts.last, contains('Completion not accepted'));
+    },
+  );
+  test(
+    'completion formatting repair preserves the successful plan and does not move UI',
+    () async {
+      final ai = Model([
+        '{"action":"replan","plan":{"strategy":"inspect requested result","subgoal":"verify detail"}}',
+        '{"action":"done","reasoning":"Interstellar 2014 visible"}',
+        '{"action":"done","completion_evidence":"Interstellar 2014","reasoning":"Result visible"}',
+      ]);
+      final screen = Screen();
+      expect((await executor(ai, screen).executeTask('search')).success, true);
+      expect(
+        ai.prompts.last,
+        contains('missing top-level completion_evidence'),
+      );
+      expect(
+        ai.prompts.last,
+        contains('"strategy":"inspect requested result"'),
+      );
+      expect(ai.prompts.last, contains('ABANDONED STRATEGIES: []'));
+      expect(screen.clicks, 0);
+      expect(screen.backs, 0);
+    },
+  );
+  test('same navigation action across distinct states remains available', () {
+    final guard = TaskProgressGuard();
+    for (final state in [
+      'player',
+      'side panel',
+      'groups',
+      'channels',
+      'search',
+    ]) {
+      guard.observe(state);
+      expect(guard.rejectionFor('press_back', {}), isNull);
+      guard.recordAttempt('press_back', {}, true, 'Accepted');
+    }
+  });
+  test('shared corridors and actual backtracking allow three new branches', () {
+    final guard = TaskProgressGuard()..observe('A');
+    void move(String action, String next) {
+      expect(
+        guard.rejectionFor(action, {}),
+        isNull,
+        reason: 'Must be able to reach $next',
+      );
+      guard.recordAttempt(action, {}, true, 'Accepted');
+      guard.observe(next);
+    }
+
+    for (final endpoint in ['E1', 'E2', 'E3']) {
+      move('forward', 'B');
+      move('forward', 'C');
+      move('forward', 'D');
+      move('forward', endpoint);
+      move('press_back', 'D');
+      move('press_back', 'C');
+      move('press_back', 'B');
+      move('press_back', 'A');
+    }
+    expect(guard.rejectionFor('forward', {}), isNull);
+  });
+  test(
+    'renaming a plan cannot erase ineffective edges; query and focus differ',
+    () {
+      final guard = TaskProgressGuard()..observe('input "query" [focused]');
+      for (var i = 0; i < 2; i++) {
+        guard.recordAttempt('press_back', {}, true, 'Accepted');
+        guard.observe('input "query" [focused]');
+      }
+      guard.abandon('stalled');
+      guard.adoptPlan({'strategy': 'new name'});
+      expect(guard.rejectionFor('press_back', {}), isNotNull);
+      guard.observe('input "query"');
+      expect(guard.rejectionFor('press_back', {}), isNull);
+      guard.observe('input "another query" [focused]');
+      expect(guard.rejectionFor('press_back', {}), isNull);
+    },
+  );
+  test(
+    'physical touch remains an executable alternative to an ineffective accessible click',
+    () async {
+      final ai = Model([
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"click_at","params":{"x":50,"y":50}}',
+        '{"action":"tap_at","params":{"x":50,"y":50}}',
+        '{"action":"done","completion_evidence":"Interstellar 2014"}',
+      ]);
+      final screen = Screen();
+      expect((await executor(ai, screen).executeTask('search')).success, true);
+      expect(screen.clicks, 2);
+      expect(screen.touches, 1);
+    },
+  );
+  test(
+    'unsupported touch is declared before planning and cannot be dispatched',
+    () async {
+      final screen = Screen()..touchSupported = false;
+      final ai = Model([
+        '{"action":"tap_at","params":{"x":50,"y":50}}',
+        '{"action":"failed","reasoning":"No applicable route"}',
+      ]);
+      expect((await executor(ai, screen).executeTask('search')).success, false);
+      expect(screen.touches, 0);
+      expect(ai.prompts.first, contains('UNAVAILABLE on this display'));
+      expect(ai.prompts.last, contains('Direct touch rejected'));
+    },
+  );
   test('confirmed completion propagates success', () async {
     final ai = Model([
-      '{"action":"done","reasoning":"Interstellar 2014 detail is visible"}',
+      '{"action":"done","reasoning":"Interstellar 2014 detail is visible","completion_evidence":"Interstellar 2014"}',
     ]);
     final handler = ActionHandler(
       createTaskExecutor: (aiService, progress) => executor(ai, Screen()),

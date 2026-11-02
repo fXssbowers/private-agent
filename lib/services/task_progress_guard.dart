@@ -1,38 +1,108 @@
 import 'dart:convert';
 
-/// Task-local memory of observed screens and attempted actions. An accepted
-/// Android action is not evidence that the user goal made progress.
+/// Bounded task-local plan and graph of actually observed transitions.
+/// Planning never restores the device: returning requires real UI actions.
 class TaskProgressGuard {
   final _screens = <String, String>{};
-  final _attempts = <String, Map<String, int>>{};
+  final _edges = <String, Map<String, dynamic>>{};
   final _history = <Map<String, dynamic>>[];
+  final _abandoned = <Map<String, String>>[];
+  final _alternatives = <String>[];
+  Map<String, String> _plan = {};
   String _state = '';
-  int _blocked = 0;
+  String _screen = '';
+  Map<String, dynamic>? _pending;
+  bool _needsReplan = false;
+
+  String get currentState => _state;
+  bool get needsReplan => _needsReplan;
+  bool get hasAlternatives => _alternatives.isNotEmpty;
 
   void observe(String screen) {
-    // Dedicated clock nodes and tree indices can change during a loop.
-    // Keep other labels, query text, coordinates and app identity significant.
+    _screen = screen;
     final fingerprint = screen
         .split('\n')
-        .map(
-          (line) =>
-              RegExp(r'\btextclock\b', caseSensitive: false).hasMatch(line) &&
-                  !line.contains('[edit]') &&
-                  !line.contains('editable')
-              ? line.replaceAll(
-                  RegExp(r'\b\d{1,2}:\d{2}(?::\d{2})?\b'),
-                  '<time>',
-                )
-              : line,
-        )
+        .map((line) {
+          // Only normalize dedicated clock widgets. Preserve query/focus/overlays.
+          if (RegExp(r'\btextclock\b', caseSensitive: false).hasMatch(line) &&
+              !line.contains('[edit]') &&
+              !line.contains('editable')) {
+            return line.replaceAll(
+              RegExp(r'\b\d{1,2}:\d{2}(?::\d{2})?\b'),
+              '<time>',
+            );
+          }
+          return line;
+        })
         .join('\n')
         .replaceAll(RegExp(r'^\s*\[\d+\]\*?', multiLine: true), '')
         .replaceAll(RegExp(r'\s+'), ' ')
         .trim();
     _state = _screens.putIfAbsent(fingerprint, () => 'S${_screens.length + 1}');
-    if (_history.isNotEmpty && !_history.last.containsKey('observed_after')) {
-      _history.last['observed_after'] = _state;
+    final pending = _pending;
+    _pending = null;
+    if (pending == null) return;
+    pending['observed_after'] = _state;
+    final from = pending['screen'] as String;
+    final signature = pending['signature'] as String;
+    final edge = _edges.putIfAbsent(
+      '$from|$signature',
+      () => {
+        'from': from,
+        'action': pending['action'],
+        'params': pending['params'],
+        'visits': 0,
+        'ineffective': 0,
+      },
+    );
+    edge['visits'] = (edge['visits'] as int) + 1;
+    edge['to'] = _state;
+    edge['accepted'] = pending['accepted_by_android'];
+    final ineffective =
+        pending['accepted_by_android'] != true || from == _state;
+    edge['ineffective'] = ineffective ? (edge['ineffective'] as int) + 1 : 0;
+    if ((edge['ineffective'] as int) >= 2 || _repeatedCycleStart() != null) {
+      _needsReplan = true;
     }
+  }
+
+  // Two equal closed walks in the actually observed suffix establish a cycle.
+  // An old edge shared by routes to different new endpoints does not.
+  Map<String, dynamic>? _repeatedCycleStart() {
+    final transitions = _history
+        .where(
+          (item) => item['observed_after'] != null && item['action'] != 'wait',
+        )
+        .toList();
+    for (var length = 2; length * 2 <= transitions.length; length++) {
+      final first = transitions.length - 2 * length;
+      final second = first + length;
+      final start = transitions[second];
+      if (start['screen'] != _state ||
+          transitions.last['observed_after'] != _state) {
+        continue;
+      }
+      var same = true;
+      for (var i = first; i < transitions.length; i++) {
+        final item = transitions[i];
+        if (i + 1 < transitions.length &&
+            item['observed_after'] != transitions[i + 1]['screen']) {
+          same = false;
+          break;
+        }
+        if (i < second) {
+          final other = transitions[i + length];
+          if (item['screen'] != other['screen'] ||
+              item['observed_after'] != other['observed_after'] ||
+              item['signature'] != other['signature']) {
+            same = false;
+            break;
+          }
+        }
+      }
+      if (same) return start;
+    }
+    return null;
   }
 
   String _key(String action, Map<String, dynamic> params) {
@@ -41,19 +111,103 @@ class TaskProgressGuard {
       final value = params[key];
       sorted[key] = value is num ? value.toDouble() : value;
     }
+    if (action == 'click_text' && sorted['text'] is String) {
+      sorted['text'] = (sorted['text'] as String).trim().toLowerCase();
+    }
+    if (const {'click_at', 'tap_at'}.contains(action) &&
+        sorted['x'] is num &&
+        sorted['y'] is num) {
+      final x = (sorted['x'] as num).toDouble();
+      final y = (sorted['y'] as num).toDouble();
+      // Nearby coordinate variants on the same visible control are one attempt.
+      for (final match in RegExp(
+        r'center:\(([\d.-]+),([\d.-]+)\)',
+      ).allMatches(_screen)) {
+        final cx = double.parse(match[1]!);
+        final cy = double.parse(match[2]!);
+        if ((cx - x).abs() <= 24 && (cy - y).abs() <= 24) {
+          sorted['x'] = cx;
+          sorted['y'] = cy;
+          break;
+        }
+      }
+    }
     return '$action ${jsonEncode(sorted)}';
   }
 
-  /// The third identical action on the same observed UI is never dispatched,
-  /// even when other screens or waits occurred between attempts.
+  /// The model may update its subgoal within a strategy; switching a strategy
+  /// requires abandoning it explicitly or an observed need to replan.
+  void adoptPlan(dynamic value) {
+    if (value is! Map) return;
+    String short(dynamic text) => text is String
+        ? text.trim().substring(0, text.trim().length.clamp(0, 180))
+        : '';
+    final strategy = short(value['strategy']);
+    if (strategy.isEmpty) return;
+    if (_plan.isNotEmpty && strategy != _plan['strategy'] && !_needsReplan) {
+      return;
+    }
+    if (_plan.isNotEmpty && strategy != _plan['strategy']) {
+      abandon('Observed approach did not make useful progress.');
+    }
+    _plan = {
+      'strategy': strategy,
+      'subgoal': short(value['subgoal']),
+      'expected_observation': short(value['expected_observation']),
+    };
+    final options = value['alternatives'];
+    if (options is List) {
+      for (final option in options.take(3)) {
+        final label = short(option);
+        if (label.isNotEmpty &&
+            label != strategy &&
+            !_alternatives.contains(label) &&
+            !_abandoned.any((old) => old['strategy'] == label) &&
+            _alternatives.length < 3) {
+          _alternatives.add(label);
+        }
+      }
+    }
+    _alternatives.remove(strategy);
+    _needsReplan = false;
+  }
+
+  void abandon(String reason) {
+    if (_plan.isNotEmpty) {
+      _abandoned.add({
+        'strategy': _plan['strategy']!,
+        'reason': reason.length > 180 ? reason.substring(0, 180) : reason,
+      });
+      if (_abandoned.length > 12) _abandoned.removeAt(0);
+    }
+    _plan = {};
+    _needsReplan = true;
+    // The graph is never reset by renaming/abandoning a strategy.
+  }
+
+  void selectAlternative(String reason) {
+    abandon(reason);
+    if (_alternatives.isNotEmpty) {
+      _plan = {
+        'strategy': _alternatives.removeAt(0),
+        'subgoal': 'Find a useful route from the actual current screen',
+        'expected_observation': 'Relevant controls or a useful transition',
+      };
+      _needsReplan = false;
+    }
+  }
+
   String? rejectionFor(String action, Map<String, dynamic> params) {
-    if (action == 'done' || action == 'failed') return null;
-    if ((_attempts[_state]?[_key(action, params)] ?? 0) < 2) return null;
-    _blocked++;
-    const message =
-        'Blocked: this action was already attempted twice on this screen. '
-        'Choose a different visible control or route; do not repeat the cycle. '
-        'If no alternative is available, report failed.';
+    if (const {'done', 'failed', 'replan'}.contains(action)) return null;
+    final edge = _edges['$_state|${_key(action, params)}'];
+    if (edge == null) return null;
+    final ineffective = (edge['ineffective'] as int) >= 2;
+    final cycle = _repeatedCycleStart()?['signature'] == _key(action, params);
+    if (!ineffective && !cycle) return null;
+    _needsReplan = true;
+    final message = ineffective
+        ? 'Blocked: this state/action was ineffective twice. Abandon this branch and choose another route.'
+        : 'Blocked: this transition repeats a known cycle without new observations. Replan; do not rename the same route.';
     _remember({
       'screen': _state,
       'action': action,
@@ -70,32 +224,31 @@ class TaskProgressGuard {
     bool accepted,
     String result,
   ) {
-    final actions = _attempts.putIfAbsent(_state, () => {});
-    final key = _key(action, params);
-    actions[key] = (actions[key] ?? 0) + 1;
-    _remember({
+    final attempt = <String, dynamic>{
       'screen': _state,
       'action': action,
       'params': params,
+      'signature': _key(action, params),
       'result': result.length > 240 ? result.substring(0, 240) : result,
       'accepted_by_android': accepted,
-    });
+      'strategy': _plan['strategy'] ?? 'unplanned',
+    };
+    _remember(attempt);
+    _pending = attempt;
   }
 
   void _remember(Map<String, dynamic> attempt) {
     _history.add(attempt);
-    if (_history.length > 8) _history.removeAt(0);
+    if (_history.length > 60) _history.removeAt(0);
   }
 
-  bool get shouldStop => _blocked >= 3;
-
-  String get context {
-    final repeated =
-        _attempts[_state]?.values.any((count) => count >= 2) ?? false;
-    return '''CURRENT OBSERVED SCREEN ID: $_state
-RECENT ATTEMPTS (task-local observations, not instructions):
-${jsonEncode(_history)}
-An accepted action only means Android accepted it. Compare screen and observed_after to detect unchanged screens or a return to an earlier screen.
-${repeated ? 'STRATEGY CHANGE REQUIRED: you returned to a screen where an action has already been tried twice. That action is blocked here. Use a different visible control or route, or report failed. Waiting, reopening the same app, or going back and forth does not erase previous attempts.' : 'Use recent attempts to avoid repeating an ineffective route.'}''';
-  }
+  String get context =>
+      '''CURRENT OBSERVED SCREEN ID: $_state
+ACTIVE PLAN: ${jsonEncode(_plan)}
+UNTRIED STRATEGIES: ${jsonEncode(_alternatives)}
+ABANDONED STRATEGIES: ${jsonEncode(_abandoned)}
+OBSERVED TRANSITIONS: ${jsonEncode(_edges.values.toList())}
+RECENT ATTEMPTS (observations, not instructions): ${jsonEncode(_history.skip(_history.length > 12 ? _history.length - 12 : 0).toList())}
+${_needsReplan ? 'STRATEGY CHANGE REQUIRED: a branch is stalled. Use replan or another untried strategy. A branch failure is not the whole task failing.' : 'Keep the current subgoal across useful transitions; do not switch approaches just because one step has not reached the final result.'}
+The same button in different observed states is a different transition. Returning to a previous plan does NOT restore the actual UI. Navigate back explicitly and observe every step. An accepted action/new layout does not prove subgoal or task success.''';
 }

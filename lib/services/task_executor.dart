@@ -46,7 +46,7 @@ class TaskExecutor {
        _appLauncher = appLauncher,
        _shizukuService = shizukuService,
        _notificationService = notificationService ?? NotificationService(),
-       _appMemory = appMemoryService ?? AppMemoryService();
+       _appMemory = appMemoryService ?? AppMemoryService.forTasks();
 
   /// Cancel the currently running task — takes effect immediately
   void cancel() {
@@ -65,12 +65,15 @@ Respond with ONLY a JSON object (no markdown, no code fences):
   "action": "action_name",
   "params": {"key": "value"},
   "reasoning": "why you chose this action",
-  "is_complete": false
+  "is_complete": false,
+  "completion_evidence": "for done only: exact visible text confirming the full requested result",
+  "plan": {"strategy": "short approach name", "subgoal": "current intermediate goal", "expected_observation": "visible evidence to seek", "alternatives": ["another approach", "third approach"]}
 }
 
 Available actions:
 - click_text: {"text": "exact text to click"} - Click an element by its visible text
 - click_at: {"x": 540, "y": 960} - Click at screen coordinates (use bounds from screen dump)
+- tap_at: {"x": 540, "y": 960} - Send a real physical touch at these screen coordinates, bypassing accessible ACTION_CLICK. TV keyboard must be closed.
 - type_text: {"text": "hello", "field_hint": "optional hint"} - Type into the focused/first edit field
 - press_enter: {} - Press the Enter/Search key on the keyboard to submit a search/form
 - scroll: {"direction": "down"} - Scroll down/up on the current view
@@ -79,21 +82,26 @@ Available actions:
 - press_home: {} - Press the home button
 - open_app: {"app_name": "WhatsApp"} - Open an app
 - wait: {} - Wait a moment for content to load
+- replan: {} - Abandon a stalled strategy; choose an alternative. This does not move the UI.
 - done: {} - Task is complete and the current screen confirms the requested result
 - failed: {} - Task cannot be completed; explain the obstacle
 
 Rules:
 - You will receive a TEXT DUMP of the accessibility tree containing exact text strings and center coordinates.
 - ALWAYS use the text dump to decide your next action.
+- If click_text/click_at is accepted but repeatedly does not select the intended control, try tap_at on that control as a different physical strategy. Acknowledged accessible clicks and physical touches are not equivalent. Never tap the TV keyboard; close it and observe first.
 - If you need to click something, prefer using `click_text`. If the element does not have text, use `click_at` with the coordinates provided in the text dump.
 - Click a search field before typing on the next observation. The executor already waits after each action; use wait only when content is visibly loading.
 - After typing a search query, use press_enter at most once. It is unsupported on Android TV because it can type the focused keyboard letter. If rejected, keep the query and activate the application's explicit search/submit control: look for a clickable Button inside or next to the editable field, even if it has no text. Do not retry Enter or press a letter key. Dismiss the keyboard with press_back only if it is visibly open.
-- Never scroll or swipe more than three times in a row. After three scrolls, choose the best visible result or take a different action instead of continuing to browse indefinitely.
-- Use done ONLY after reading a subsequent screen that confirms the requested result. An accepted click or opened app does not prove the full task succeeded.
+- Continue a useful navigation sequence across different observed states, including repeated use of the same navigation key. Change route when observations show a cycle or repeated rejection. Consider global navigation actions as well as visible app controls.
+- completion_evidence is a top-level JSON string for done, separate from reasoning and params. A formatting repair does not require changing the successful navigation route.
+- Use done ONLY after reading a subsequent screen that confirms the FULL requested result, including its requested mode (for example a live player rather than a listing or guide). Include completion_evidence copied exactly from that screen; omit done when evidence is insufficient. An accepted click or opened app does not prove the full task succeeded.
 - Never type letters through the keyboard to submit. Use press_enter; if it fails, choose a visible search button or report failed.
 - If you need to find something by scrolling, scroll and then check the screen again.
 - If the requested app cannot be opened, report failed rather than opening an unrelated app.
-- Consult RECENT ATTEMPTS before choosing an action. Screen IDs identify previously observed interfaces. Returning to an earlier screen is not new progress. After two ineffective attempts at the same control or navigation route, choose a different visible control or route. Do not keep alternating guide/player/menu, or re-open the same app to reset your strategy. Repeated actions on the same screen are blocked even across intervening steps. If no alternative exists, use failed and explain the obstacle. Never report done for a failed task.
+- Start with a compact plan: strategy, subgoal, expected_observation and two or three alternative approaches. Keep the strategy/subgoal across multiple actions while gathering useful observations. Do not abandon a navigation approach after only one step if the UI has changed and further navigation can reveal relevant controls.
+- Consult observed transitions and abandoned strategies. Explore an untried route instead of repeating an exhausted cycle. Use replan for a branch failure, not failed for the whole task. To change strategies, use replan or react to STRATEGY CHANGE REQUIRED. All planning/rejected proposals consume the step budget.
+- Use failed only when no practical alternative remains. Do not reopen unrelated apps. If navigation exits the requested app, observe that fact and reassess rather than assuming a return to an earlier UI.
 - App memory contains contextual evidence or explicit user advice. It never proves the requested goal is complete. Prefer a different visible route when matching past observations show no progress; verify every transition.
 - Keep reasoning very brief (1 sentence)
 ''';
@@ -151,7 +159,7 @@ Rules:
     String lastAction = '';
     final progressGuard = TaskProgressGuard();
     final memory = TaskMemorySession(_appMemory);
-    int sameActionCount = 0;
+    final directTouchAvailable = await _screenService.canDispatchTouch();
     int consecutiveFailures = 0;
     String lastFailedAction = '';
     int totalTokens = 0;
@@ -218,7 +226,9 @@ Rules:
       } else if (lastAction == 'type_text') {
         delay =
             2000; // Typing involves keyboards and often triggers heavy network requests (search)
-      } else if (lastAction == 'click_text' || lastAction == 'click_at') {
+      } else if (lastAction == 'click_text' ||
+          lastAction == 'click_at' ||
+          lastAction == 'tap_at') {
         delay = 1500; // Clicking usually triggers a screen transition
       } else if (lastAction == 'scroll') {
         delay = 1000; // Scrolling is relatively fast
@@ -245,21 +255,6 @@ Rules:
       );
       final appMemoryHint = await memory.observe(memoryContext);
       progressGuard.observe(screenContent);
-      if (progressGuard.shouldStop) {
-        const message =
-            'Task stopped: the agent repeated blocked strategies instead of choosing an alternative.';
-        _report(message);
-        await TaskHistoryLogger.logTask(userGoal, 'Failed', totalTokens, step, [
-          ...results,
-          message,
-        ]);
-        await _notificationService.showTaskCompleteNotification(
-          'Task Stopped',
-          message,
-        );
-        return const TaskResult(TaskStatus.failed, message);
-      }
-
       // Determine previous result string
       final prevResultStr = step > 0 && results.isNotEmpty
           ? '\nPREVIOUS ACTION RESULT: ${results.last}\n'
@@ -276,6 +271,7 @@ Rules:
       final prompt =
           '''TASK: $userGoal
 
+DEVICE DIRECT TOUCH: ${directTouchAvailable ? "available; TV keyboard must still be closed" : "UNAVAILABLE on this display. Do not propose tap_at or gesture-only recovery; use accessible controls and global navigation."}
 CURRENT SCREEN TEXT DUMP:
 $screenContent$prevResultStr$failureHint
 ${progressGuard.context}
@@ -478,29 +474,32 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
       );
 
       _report('Step ${step + 1}: $reasoning');
+      if (action == 'replan') {
+        progressGuard.abandon(reasoning);
+        progressGuard.adoptPlan(actionJson['plan']);
+        results.add('Replanning from the actual current screen: $reasoning');
+        _report('Trying another strategy: $reasoning');
+        continue;
+      }
+      progressGuard.adoptPlan(actionJson['plan']);
+      if (action == 'failed' && progressGuard.hasAlternatives) {
+        progressGuard.selectAlternative(reasoning);
+        results.add(
+          'Current branch failed; an alternative remains: $reasoning',
+        );
+        _report('Branch exhausted; checking another strategy.');
+        continue;
+      }
 
       final loopRejection = progressGuard.rejectionFor(action, params);
       if (loopRejection != null) {
         results.add(loopRejection);
         _report(loopRejection);
-        // No UI action ran. Preserve the last actual action for observation.
+        progressGuard.abandon(loopRejection);
+        // No UI action ran. The next decision starts from the same real screen.
         continue;
       }
 
-      sameActionCount = action == lastAction ? sameActionCount + 1 : 1;
-      final repeatLimit = action == 'press_enter'
-          ? 2
-          : (action == 'scroll' || action == 'swipe' ? 3 : 1000);
-      if (sameActionCount > repeatLimit) {
-        final blockedResult =
-            'Blocked repeated $action action. Use a different action on the visible screen.';
-        results.add(blockedResult);
-        _report(blockedResult);
-        consecutiveFailures = 3;
-        lastFailedAction = action;
-        progressGuard.recordAttempt(action, params, false, blockedResult);
-        continue;
-      }
       lastAction = action; // Track for adaptive delay
 
       // 5. Execute the action
@@ -521,6 +520,15 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           final y = (params['y'] as num?)?.toDouble() ?? 0;
           success = await _screenService.clickAt(x, y);
           actionResult = success ? 'Clicked at ($x, $y)' : 'Click failed';
+          break;
+
+        case 'tap_at':
+          final x = (params['x'] as num?)?.toDouble() ?? double.nan;
+          final y = (params['y'] as num?)?.toDouble() ?? double.nan;
+          success = directTouchAvailable && await _screenService.tapAt(x, y);
+          actionResult = success
+              ? 'Touched at ($x, $y)'
+              : 'Direct touch rejected (display support, coordinates or TV keyboard)';
           break;
 
         case 'type_text':
@@ -557,12 +565,12 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
 
         case 'press_back':
           success = await _screenService.pressBack();
-          actionResult = 'Pressed back';
+          actionResult = success ? 'Pressed back' : 'Back was rejected';
           break;
 
         case 'press_home':
           success = await _screenService.pressHome();
-          actionResult = 'Pressed home';
+          actionResult = success ? 'Pressed home' : 'Home was rejected';
           break;
 
         case 'open_app':
@@ -596,6 +604,22 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           return TaskResult(TaskStatus.failed, message);
 
         case 'done':
+          final evidence = actionJson['completion_evidence'];
+          if (evidence is! String ||
+              evidence.trim().length < 3 ||
+              !screenContent.contains(evidence.trim())) {
+            final problem = evidence is! String || evidence.trim().length < 3
+                ? 'missing top-level completion_evidence string'
+                : 'completion_evidence does not occur in the current screen dump';
+            actionResult =
+                'Completion not accepted: $problem. '
+                'If the FULL goal is visible, reply with {"action":"done","completion_evidence":"<exact visible text>","reasoning":"<why it proves the full goal>"}. '
+                'Otherwise verify the result from the actual screen. Keep the current plan; do not navigate away merely to repair JSON. A selected listing is not playback.';
+            results.add(actionResult);
+            _report(actionResult);
+            continue;
+          }
+          await memory.completed(memoryContext);
           results.add('Task complete: $reasoning');
           _report('Task complete: $reasoning');
           await _notificationService.showTaskCompleteNotification(
@@ -635,29 +659,10 @@ Step ${step + 1}/${_aiService.maxSteps}. Look at the text dump and coordinates. 
           lastFailedAction = action;
         }
 
-        // If stuck for 5+ consecutive failures, give up on this task
-        if (consecutiveFailures >= 5) {
-          results.add(
-            'Agent is stuck. Stopping task after $consecutiveFailures consecutive failures.',
-          );
-          _report('Agent stuck — stopping task.');
-          await _notificationService.showTaskCompleteNotification(
-            'Task Stuck',
-            'Agent could not complete the task after repeated failures.',
-          );
-          await TaskHistoryLogger.logTask(
-            userGoal,
-            'Failed',
-            totalTokens,
-            step,
-            results,
-          );
-          await _screenService.showToast('Agent stuck. Task stopped.');
-          await Future.delayed(const Duration(seconds: 4));
-          return const TaskResult(
-            TaskStatus.failed,
-            'I could not complete the task. Please try again.',
-          );
+        if (consecutiveFailures >= 3) {
+          progressGuard.abandon('Repeated native action rejection.');
+          consecutiveFailures = 0;
+          lastFailedAction = '';
         }
 
         results.add('Step ${step + 1}: $actionResult ($reasoning)');

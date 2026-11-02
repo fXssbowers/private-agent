@@ -38,7 +38,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   late TextEditingController _telegramTokenController;
   bool _obscureKey = true;
   bool _telegramEnabled = false;
-  double _maxSteps = 15;
+  double _maxSteps = 60;
   bool _disableMaxSteps = false;
   late TextEditingController _maxTokensController;
   double _temperature = 1.0;
@@ -617,8 +617,8 @@ class _SettingsScreenState extends State<SettingsScreen>
                 Slider(
                   value: _maxSteps,
                   min: 5,
-                  max: 50,
-                  divisions: 45,
+                  max: 100,
+                  divisions: 95,
                   label: _maxSteps.toInt().toString(),
                   onChanged: (value) {
                     setState(() {

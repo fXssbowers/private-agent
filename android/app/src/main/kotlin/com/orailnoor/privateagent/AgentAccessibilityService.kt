@@ -188,6 +188,7 @@ class AgentAccessibilityService : AccessibilityService() {
                     "isCheckable" to node.isCheckable,
                     "isChecked" to node.isChecked,
                     "isFocused" to node.isFocused,
+                    "isSelected" to node.isSelected,
                     "bounds" to mapOf(
                         "left" to rect.left,
                         "top" to rect.top,
@@ -331,6 +332,22 @@ class AgentAccessibilityService : AccessibilityService() {
             }
         }
         if (keyboardOpenOnTv()) callback(false) else dispatchTap(x, y, callback)
+    }
+
+    // Android 11 checks Configuration.TOUCHSCREEN_FINGER independently of
+    // the accessibility service's granted gesture permission.
+    fun canDispatchTouch(): Boolean = resources.configuration.touchscreen ==
+        android.content.res.Configuration.TOUCHSCREEN_FINGER
+
+    /** Explicit physical touch alternative: never reinterpret it as ACTION_CLICK. */
+    fun tapAtCoordinates(x: Float, y: Float, callback: (Boolean) -> Unit) {
+        val display = resources.displayMetrics
+        if (!x.isFinite() || !y.isFinite() || x < 0 || y < 0 ||
+            x >= display.widthPixels || y >= display.heightPixels || !canDispatchTouch() ||
+            (isTelevisionDevice() && windows.isEmpty()) || keyboardOpenOnTv()) {
+            callback(false); return
+        }
+        dispatchTap(x, y, callback)
     }
 
     private fun dispatchTap(x: Float, y: Float, callback: (Boolean) -> Unit) {

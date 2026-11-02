@@ -51,7 +51,7 @@ class AiService {
   String? _apiKey;
   String _baseUrl = _defaultBaseUrl;
   String _model = _defaultModel;
-  int _maxSteps = 15;
+  int _maxSteps = 60;
   bool _disableMaxSteps = false;
   double _temperature = 1.0;
   int _maxTokens = 1024;
@@ -110,7 +110,7 @@ Answer questions, explain concepts, brainstorm, write emails/messages, and chat 
     _apiKey = prefs.getString('api_key');
     _baseUrl = prefs.getString('api_base_url') ?? _defaultBaseUrl;
     _model = prefs.getString('api_model') ?? _defaultModel;
-    _maxSteps = prefs.getInt('api_max_steps') ?? 15;
+    _maxSteps = prefs.getInt('api_max_steps') ?? 60;
     _disableMaxSteps = prefs.getBool('api_disable_max_steps') ?? false;
     _temperature = prefs.getDouble('api_temperature') ?? 1.0;
     _maxTokens = prefs.getInt('api_max_tokens') ?? 1024;

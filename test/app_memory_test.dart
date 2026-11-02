@@ -36,6 +36,7 @@ void main() {
     store = AppMemoryService(directory: directory);
   });
   tearDown(() async {
+    AppMemoryService.endTemporarySession();
     await directory.delete(recursive: true);
   });
 
@@ -174,7 +175,7 @@ void main() {
     expect(await store.readApp('test.tv', '1'), isNull);
   });
   test(
-    'per-app and total limits use UTF8 bytes and retain at most five prompt notes',
+    'per-app and total limits use UTF8 bytes and prompt includes every pertinent stored note',
     () async {
       for (var app = 0; app < 25; app++) {
         for (var note = 0; note < 8; note++) {
@@ -203,7 +204,16 @@ void main() {
         frame(searchScreen, app: 'test.app24'),
       );
       final payload = prompt.split('\n')[1];
-      expect(jsonDecode(payload) as List, hasLength(5));
+      expect(
+        jsonDecode(payload) as List,
+        hasLength(
+          ((await store.readApp('test.app24', '1'))!['lessons'] as List).length,
+        ),
+      );
+      expect(
+        utf8.encode(payload).length,
+        lessThanOrEqualTo(AppMemoryService.maxAppBytes),
+      );
     },
   );
   test(
@@ -257,6 +267,142 @@ void main() {
     );
     expect(lock.existsSync(), false);
   });
+  test(
+    'empty temporary session preserves production notes and shares only its own learning',
+    () async {
+      await store.saveUserLesson(
+        'test.tv',
+        '1',
+        when: 'Saved condition',
+        advice: 'Saved solution',
+        expected: 'Menu',
+      );
+      final original = File('${directory.path}/test.tv.json').readAsBytesSync();
+      AppMemoryService.beginTemporarySession();
+      final fresh = AppMemoryService.forTasks();
+      expect(await fresh.promptFor(frame(searchScreen)), isEmpty);
+      await fresh.recordObservation(
+        frame(searchScreen),
+        {'action': 'press_back'},
+        frame(resultScreen),
+        true,
+      );
+      expect(
+        await AppMemoryService.forTasks().promptFor(frame(searchScreen)),
+        contains('changed'),
+      );
+      expect(
+        await fresh.promptFor(frame(searchScreen)),
+        isNot(contains('Saved solution')),
+      );
+      AppMemoryService.endTemporarySession();
+      expect(
+        File('${directory.path}/test.tv.json').readAsBytesSync(),
+        original,
+      );
+      AppMemoryService.beginTemporarySession();
+      expect(
+        await AppMemoryService.forTasks().promptFor(frame(searchScreen)),
+        isEmpty,
+      );
+    },
+  );
+  test(
+    'all six pertinent hints are loaded, unrelated context and version are excluded',
+    () async {
+      for (var i = 0; i < 6; i++) {
+        await store.saveUserLesson(
+          'test.tv',
+          '1',
+          when: 'Condition $i',
+          advice: 'Advice $i',
+          expected: 'Menu',
+        );
+      }
+      expect(
+        jsonDecode((await store.promptFor(frame(searchScreen))).split('\n')[1]),
+        hasLength(6),
+      );
+      expect(await store.promptFor(frame(searchScreen, version: '2')), isEmpty);
+    },
+  );
+  test(
+    'only observed navigation prefix survives completion, query and title are absent',
+    () async {
+      final session = TaskMemorySession(store);
+      session.record(frame(searchScreen), 'press_back', {}, true);
+      await session.observe(frame(resultScreen));
+      expect(
+        ((await store.readApp('test.tv', '1'))!['lessons'] as List).where(
+          (l) => l['source'] == 'observed_route',
+        ),
+        isEmpty,
+      );
+      session.record(frame(resultScreen), 'type_text', {
+        'text': 'Private query',
+      }, true);
+      await session.observe(frame(resultScreen));
+      session.record(frame(resultScreen), 'click_text', {
+        'text': 'Private title',
+      }, true);
+      await session.observe(frame(searchScreen));
+      await session.completed(frame(searchScreen));
+      final text = File('${directory.path}/test.tv.json').readAsStringSync();
+      expect(text, isNot(contains('Private')));
+      final route = ((await store.readApp('test.tv', '1'))!['lessons'] as List)
+          .singleWhere((l) => l['source'] == 'observed_route');
+      expect(route['steps'], hasLength(1));
+      expect(route['steps'][0]['action'], 'press_back');
+      expect(route['provenance'], contains('not independent'));
+      expect(
+        await store.promptFor(frame(resultScreen)),
+        isNot(contains('observed_route')),
+      );
+      expect(
+        await store.promptFor(frame(searchScreen)),
+        contains('observed_route'),
+      );
+    },
+  );
+  test(
+    'coordinate interaction closes the prefix but retains one-step evidence',
+    () async {
+      final session = TaskMemorySession(store);
+      session.record(frame(searchScreen), 'press_back', {}, true);
+      await session.observe(frame(resultScreen));
+      session.record(frame(resultScreen), 'swipe', {
+        'startX': 10,
+        'startY': 20,
+        'endX': 30,
+        'endY': 40,
+      }, true);
+      await session.observe(frame(searchScreen));
+      session.record(frame(searchScreen), 'press_back', {}, true);
+      await session.observe(frame(resultScreen));
+      await session.completed(frame(resultScreen));
+      final notes = (await store.readApp('test.tv', '1'))!['lessons'] as List;
+      final route = notes.singleWhere((l) => l['source'] == 'observed_route');
+      expect(route['steps'], hasLength(1));
+      expect(jsonEncode(route), isNot(contains('startX')));
+      expect(notes.any((l) => l['action'] == 'swipe'), true);
+    },
+  );
+  test(
+    'direct touch is observed but closes reusable prefix before coordinates',
+    () async {
+      final session = TaskMemorySession(store);
+      session.record(frame(searchScreen), 'press_back', {}, true);
+      await session.observe(frame(resultScreen));
+      session.record(frame(resultScreen), 'tap_at', {'x': 100, 'y': 200}, true);
+      await session.observe(frame(searchScreen));
+      await session.completed(frame(searchScreen));
+      final notes = (await store.readApp('test.tv', '1'))!['lessons'] as List;
+      expect(notes.any((l) => l['action'] == 'tap_at'), true);
+      final route = notes.singleWhere((l) => l['source'] == 'observed_route');
+      expect(route['steps'], hasLength(1));
+      expect(jsonEncode(route), isNot(contains('coordinates')));
+    },
+  );
   test('invalid app IDs and sensitive user notes cannot be stored', () async {
     await expectLater(
       store.saveUserLesson(
@@ -312,7 +458,7 @@ void main() {
     final notes =
         jsonDecode((await store.promptFor(frame(searchScreen))).split('\n')[1])
             as List;
-    expect(notes.length, lessThanOrEqualTo(5));
+    expect(notes.length, 6);
     expect(notes.any((n) => n['source'] == 'observed'), true);
   });
 }

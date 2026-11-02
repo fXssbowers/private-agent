@@ -150,6 +150,21 @@ class MainActivity : FlutterActivity() {
                             }
                         }
 
+                        "canDispatchTouch" -> {
+                            result.success(AgentAccessibilityService.instance?.canDispatchTouch() ?: false)
+                        }
+
+                        "tapAt" -> {
+                            val x = call.argument<Double>("x")?.toFloat() ?: Float.NaN
+                            val y = call.argument<Double>("y")?.toFloat() ?: Float.NaN
+                            val service = AgentAccessibilityService.instance
+                            if (service == null) {
+                                result.error("SERVICE_NOT_RUNNING", "Accessibility service is not running", null)
+                            } else {
+                                service.tapAtCoordinates(x, y) { result.success(it) }
+                            }
+                        }
+
                         "typeText" -> {
                             val text = call.argument<String>("text") ?: ""
                             val hint = call.argument<String>("fieldHint")

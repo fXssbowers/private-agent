@@ -109,8 +109,9 @@ Map<String, dynamic>? memoryAction(String action, Map<String, dynamic> params) {
       if (!memoryNavigationLabels.contains(target)) return null;
       return {'action': action, 'target': target};
     case 'click_at':
+    case 'tap_at':
     case 'swipe':
-      final keys = action == 'click_at'
+      final keys = action != 'swipe'
           ? ['x', 'y']
           : ['startX', 'startY', 'endX', 'endY'];
       final target = <String, double>{};

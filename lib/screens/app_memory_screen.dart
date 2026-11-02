@@ -19,7 +19,7 @@ class AppMemoryScreen extends StatefulWidget {
 }
 
 class _AppMemoryScreenState extends State<AppMemoryScreen> {
-  late final _store = widget.store ?? AppMemoryService();
+  AppMemoryService get _store => widget.store ?? AppMemoryService.forTasks();
   late final _screen = widget.screenService ?? ScreenAutomationService();
   final _when = TextEditingController();
   final _advice = TextEditingController();
@@ -173,6 +173,25 @@ class _AppMemoryScreenState extends State<AppMemoryScreen> {
     }
   }
 
+  Future<void> _toggleTemporary() async {
+    if (AppMemoryService.temporarySessionActive) {
+      AppMemoryService.endTemporarySession();
+    } else {
+      AppMemoryService.beginTemporarySession();
+    }
+    _when.clear();
+    _advice.clear();
+    _expected.clear();
+    if (_package != null) {
+      await _select(_package!);
+    } else {
+      setState(() {
+        _lessons = [];
+        _bytes = 0;
+      });
+    }
+  }
+
   @override
   void dispose() {
     _when.dispose();
@@ -190,6 +209,22 @@ class _AppMemoryScreenState extends State<AppMemoryScreen> {
         const Text(
           'Navigation lessons stay on this device. Relevant notes are included when the agent uses the selected app. Each step still needs screen verification.',
         ),
+        if (widget.store == null) ...[
+          const SizedBox(height: 12),
+          Text(
+            AppMemoryService.temporarySessionActive
+                ? 'Temporary learning session: main-app tasks ignore saved notes. Learning lasts until you end this session or restart the app. Original notes are preserved. Start a new chat before testing.'
+                : 'You can test learning from an empty memory in the main app. The floating assistant uses normal saved memory.',
+          ),
+          TextButton(
+            onPressed: _busy ? null : _toggleTemporary,
+            child: Text(
+              AppMemoryService.temporarySessionActive
+                  ? 'End temporary session and discard its learning'
+                  : 'Start empty temporary learning session',
+            ),
+          ),
+        ],
         const SizedBox(height: 16),
         DropdownButtonFormField<String>(
           initialValue: _package,
@@ -296,6 +331,8 @@ class _AppMemoryScreenState extends State<AppMemoryScreen> {
                 child: Text(
                   note['source'] == 'user'
                       ? 'Your advice · ${note["context"]}\n${note["advice"]}\nExpected: ${note["expected"]}'
+                      : note['source'] == 'observed_route'
+                      ? 'Observed navigation prefix · ${note["context"]}\n${note["steps"]}\n${note["provenance"]}'
                       : 'Observed · ${note["context"]}\n${note["action"]} ${note["target"] ?? note["coordinates"] ?? note["direction"] ?? ""}\nLast: ${note["last_outcome"]}. Changed: ${note["changed"]}, unchanged: ${note["unchanged"]}, rejected: ${note["rejected"]}.\n${note["expected"]}',
                 ),
               ),

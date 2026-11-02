@@ -74,6 +74,29 @@ class TvControlInstrumentation : Instrumentation() {
                     check(action { control.clickAtCoordinates(x, y, it) }) { "Node click rejected" }
                     SystemClock.sleep(300)
                     check(nodes(control).any { it["text"] == "ACTIVATED" }) { "Wrong control activated" }
+                    if (nodes(control).any { it["className"] == "KeyboardStatus" }) {
+                        check(action { done -> done(control.pressBack()) }) { "Could not close fixture keyboard" }
+                        SystemClock.sleep(1000)
+                    }
+                    val touchTarget = nodes(control).first { it["text"] == "Touch alternative" }
+                    val tb = touchTarget["bounds"] as Map<*, *>
+                    val tx = ((tb["left"] as Int) + (tb["right"] as Int)) / 2f
+                    val ty = ((tb["top"] as Int) + (tb["bottom"] as Int)) / 2f
+                    check(action { control.clickByText("Touch alternative", it) })
+                    check(nodes(control).any { it["text"] == "ACK_WITHOUT_SELECTION" }) { "Accessible-click fixture did not acknowledge" }
+                    sendStatus(0, Bundle().apply { putString("touch_stage", "x=$tx y=$ty display=${control.resources.displayMetrics.widthPixels}x${control.resources.displayMetrics.heightPixels} touchscreen=${control.resources.configuration.touchscreen} keyboard=${nodes(control).any { it["className"] == "KeyboardStatus" }}") })
+                    if (control.canDispatchTouch()) {
+                        check(action { control.tapAtCoordinates(tx, ty, it) }) { "Direct touch rejected" }
+                        SystemClock.sleep(300)
+                        check(nodes(control).any { it["text"] == "TOUCH_SELECTED" }) { "Direct touch did not bypass accessible click" }
+                        sendStatus(0, Bundle().apply { putString("touch_result", "PASS: physical touch bypassed accessible acknowledgement") })
+                    } else {
+                        check(!action { control.tapAtCoordinates(tx, ty, it) }) { "Non-touch display claimed success" }
+                        check(nodes(control).any { it["text"] == "ACK_WITHOUT_SELECTION" })
+                        sendStatus(0, Bundle().apply { putString("touch_result", "UNSUPPORTED: display is not configured as touchscreen; actual touch NOT validated") })
+                    }
+                    check(!action { control.tapAtCoordinates(-1f, ty, it) }) { "Invalid touch accepted" }
+                    check(!action { control.tapAtCoordinates(100000f, ty, it) }) { "Out-of-display touch accepted" }
                     check(action { control.clickByText("Film", it) }) { "Editable focus rejected" }
                     SystemClock.sleep(1500)
                     check(action { done -> done(control.typeText("Interstellar", "Film")) }) { "Text entry rejected" }
@@ -81,6 +104,8 @@ class TvControlInstrumentation : Instrumentation() {
                     checkQuery(control, "after typing")
                     check(nodes(control).any { it["className"] == "KeyboardStatus" }) { "Open TV keyboard was not detected" }
                     check(nodes(control).none { it["text"]?.toString() == "q" }) { "TV keyboard keys leaked into app controls" }
+                    check(!action { control.tapAtCoordinates(600f, 750f, it) }) { "Direct touch bypassed TV keyboard guard" }
+                    checkQuery(control, "after guarded direct touch")
                     check(!action { control.clickByText("q", it) }) { "Keyboard letter was exposed as app control" }
                     action { control.clickAtCoordinates(600f, 750f, it) }
                     SystemClock.sleep(400)
@@ -169,7 +194,19 @@ class TvControlFixtureActivity : Activity() {
                 return super.performAccessibilityAction(action, arguments)
             }
         }.apply { text = "Virtual control"; isClickable = false }
-        layout.addView(button); layout.addView(editor); layout.addView(search); layout.addView(result); layout.addView(virtual); layout.addView(status)
+        val touchAlternative = object : TextView(this) {
+            override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
+                if (action == android.view.accessibility.AccessibilityNodeInfo.ACTION_CLICK) {
+                    status.text = "ACK_WITHOUT_SELECTION"; return true
+                }
+                return super.performAccessibilityAction(action, arguments)
+            }
+            override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
+                if (event.action == android.view.MotionEvent.ACTION_UP) status.text = "TOUCH_SELECTED"
+                return true
+            }
+        }.apply { text = "Touch alternative"; isClickable = true; minHeight = 80 }
+        layout.addView(button); layout.addView(editor); layout.addView(search); layout.addView(result); layout.addView(virtual); layout.addView(touchAlternative); layout.addView(status)
         setContentView(layout)
     }
 }

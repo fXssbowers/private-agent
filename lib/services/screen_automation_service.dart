@@ -107,7 +107,8 @@ class ScreenAutomationService {
       final isScrollable = node['isScrollable'] == true;
 
       String displayText = text.isNotEmpty ? text : desc;
-      if (displayText.isEmpty && !isClickable && !isEditable && !isScrollable) {
+      if (displayText.isEmpty && !isClickable && !isEditable && !isScrollable &&
+          node['isFocused'] != true && node['isSelected'] != true) {
         continue; // Skip empty non-interactive nodes
       }
 
@@ -120,6 +121,8 @@ class ScreenAutomationService {
       if (isClickable) tags.add('clickable');
       if (isEditable) tags.add('editable');
       if (isScrollable) tags.add('scrollable');
+      if (node['isFocused'] == true) tags.add('focused');
+      if (node['isSelected'] == true) tags.add('selected');
 
       final label = displayText.isNotEmpty ? '"$displayText"' : '(no text)';
       final type = className.isNotEmpty ? '[$className]' : '';
@@ -133,7 +136,7 @@ class ScreenAutomationService {
         boundsStr = ' bounds:[${b['left']},${b['top']},${b['right']},${b['bottom']}] center:(${centerX.round()},${centerY.round()})';
       }
 
-      buffer.writeln('  [$index] $type $label $tagStr$boundsStr');
+      buffer.writeln('  [$index] $type $label $tagStr$boundsStr id:${node["viewId"] ?? ""}');
       count++;
     }
 
@@ -175,12 +178,12 @@ class ScreenAutomationService {
           lowerText.contains('do not disturb') ||
           lowerText.contains('three bars') ||
           lowerText == '🛑 stop macro' ||
-          lowerText == 'stop macro' ||
-          RegExp(r'^\d{1,2}:\d{2}$').hasMatch(lowerText)) { // time
+          lowerText == 'stop macro') {
         continue;
       }
 
-      if (displayText.isEmpty && !isClickable && !isEditable && !isScrollable) {
+      if (displayText.isEmpty && !isClickable && !isEditable && !isScrollable &&
+          node['isFocused'] != true && node['isSelected'] != true) {
         continue; // Skip empty non-interactive nodes
       }
 
@@ -193,6 +196,8 @@ class ScreenAutomationService {
       if (isClickable) tags.add('tap');
       if (isEditable) tags.add('edit');
       if (isScrollable) tags.add('scroll');
+      if (node['isFocused'] == true) tags.add('focused');
+      if (node['isSelected'] == true) tags.add('selected');
 
       // Simplify type
       String type = className.split('.').last;
@@ -228,7 +233,7 @@ class ScreenAutomationService {
         boundsStr = ' center:(${centerX.round()},${centerY.round()})';
       }
 
-      buffer.writeln('[$index]$targetMark $type $label $tagStr$boundsStr'.trim().replaceAll(RegExp(r'\s+'), ' '));
+      buffer.writeln('[$index]$targetMark $type $label $tagStr$boundsStr id:${node["viewId"] ?? ""}'.trim().replaceAll(RegExp(r'\s+'), ' '));
     }
 
     final screenString = buffer.toString();
@@ -262,6 +267,25 @@ class ScreenAutomationService {
               .invokeMethod<bool>('clickAt', {'x': x, 'y': y}) ??
           false;
     } catch (e) {
+      return false;
+    }
+  }
+
+  /// Conservative display capability, separate from the service's permission.
+  Future<bool> canDispatchTouch() async {
+    try {
+      return await _invoke<bool>('canDispatchTouch') ?? false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Physical touch alternative when an accepted accessible click was ineffective.
+  /// The native TV keyboard guard also applies to this path.
+  Future<bool> tapAt(double x, double y) async {
+    try {
+      return await _invoke<bool>('tapAt', {'x': x, 'y': y}) ?? false;
+    } catch (_) {
       return false;
     }
   }

@@ -9,8 +9,18 @@ import '../storage/small_file_transaction.dart';
 class AppMemoryService {
   static const maxAppBytes = 8 * 1024;
   static const maxTotalBytes = 64 * 1024;
+  // A clean evaluation session is deliberately volatile. Main-app task runs
+  // share it across chats; restarting the process restores the normal store.
+  static AppMemoryService? _temporary;
+  static bool get temporarySessionActive => _temporary != null;
+  static AppMemoryService forTasks() => _temporary ?? AppMemoryService();
+  static void beginTemporarySession() =>
+      _temporary = AppMemoryService._volatile();
+  static void endTemporarySession() => _temporary = null;
+  final Map<String, Map<String, dynamic>>? _volatileDocs;
+  AppMemoryService._volatile() : directory = null, _volatileDocs = {};
   final Directory? directory;
-  AppMemoryService({this.directory});
+  AppMemoryService({this.directory}) : _volatileDocs = null;
 
   Future<Directory> get _directory async =>
       directory ??
@@ -39,6 +49,12 @@ class AppMemoryService {
 
   Future<Map<String, dynamic>?> inspectApp(String package) async {
     if (!_validPackage(package)) return null;
+    if (_volatileDocs != null) {
+      final doc = _volatileDocs[package];
+      return doc == null
+          ? null
+          : jsonDecode(jsonEncode(doc)) as Map<String, dynamic>;
+    }
     final dir = await _directory;
     final doc = _read(File('${dir.path}/$package.json'));
     return doc?['package'] == package ? doc : null;
@@ -50,6 +66,12 @@ class AppMemoryService {
   }
 
   Future<int> storageBytes() async {
+    if (_volatileDocs != null) {
+      return _volatileDocs.values.fold<int>(
+        0,
+        (sum, doc) => sum + utf8.encode(jsonEncode(doc)).length,
+      );
+    }
     final dir = await _directory;
     if (!await dir.exists()) return 0;
     return dir.listSync().whereType<File>().fold<int>(
@@ -141,6 +163,10 @@ class AppMemoryService {
 
   Future<void> clearApp(String package) async {
     if (!_validPackage(package)) throw const FormatException('Invalid app');
+    if (_volatileDocs != null) {
+      _volatileDocs.remove(package);
+      return;
+    }
     final dir = await _directory;
     await smallFileTransaction(dir, 'memory', () {
       final file = File('${dir.path}/$package.json');
@@ -156,6 +182,24 @@ class AppMemoryService {
     if (!_validPackage(package) || version.isEmpty || version.length > 160) {
       throw const FormatException('Invalid app version');
     }
+    if (_volatileDocs != null) {
+      final doc = _changedDocument(
+        _volatileDocs[package],
+        package,
+        version,
+        change,
+      );
+      _volatileDocs.remove(package);
+      _volatileDocs[package] = doc;
+      while (_volatileDocs.values.fold<int>(
+            0,
+            (sum, d) => sum + utf8.encode(jsonEncode(d)).length,
+          ) >
+          maxTotalBytes) {
+        _volatileDocs.remove(_volatileDocs.keys.first);
+      }
+      return;
+    }
     final dir = await _directory;
     await smallFileTransaction(dir, 'memory', () {
       // A failed prior atomic write may leave this staging file. We own the
@@ -164,30 +208,8 @@ class AppMemoryService {
       if (staging.existsSync()) staging.deleteSync();
       final file = File('${dir.path}/$package.json');
       final old = _read(file);
-      final lessons = old?['version'] == version
-          ? (old!['lessons'] as List)
-                .whereType<Map>()
-                .map((l) => Map<String, dynamic>.from(l))
-                .toList()
-          : <Map<String, dynamic>>[];
-      change(lessons);
-      final doc = <String, dynamic>{
-        'schema': 1,
-        'package': package,
-        'version': version,
-        'updated': DateTime.now().microsecondsSinceEpoch,
-        'lessons': lessons,
-      };
-      List<int> encode() => utf8.encode(jsonEncode(doc));
-      // Prefer retaining explicit user advice; evict older observations first.
-      while (encode().length > maxAppBytes && lessons.isNotEmpty) {
-        final observed = lessons.indexWhere((l) => l['source'] != 'user');
-        lessons.removeAt(observed < 0 ? 0 : observed);
-      }
-      final bytes = encode();
-      if (bytes.length > maxAppBytes) {
-        throw const FormatException('Memory note too large');
-      }
+      final doc = _changedDocument(old, package, version, change);
+      final bytes = utf8.encode(jsonEncode(doc));
       final files =
           dir
               .listSync(followLinks: false)
@@ -218,6 +240,66 @@ class AppMemoryService {
     });
   }
 
+  Map<String, dynamic> _changedDocument(
+    Map<String, dynamic>? old,
+    String package,
+    String version,
+    void Function(List<Map<String, dynamic>>) change,
+  ) {
+    final lessons = old?['version'] == version
+        ? (old!['lessons'] as List)
+              .whereType<Map>()
+              .map((l) => Map<String, dynamic>.from(l))
+              .toList()
+        : <Map<String, dynamic>>[];
+    change(lessons);
+    final doc = <String, dynamic>{
+      'schema': 1,
+      'package': package,
+      'version': version,
+      'updated': DateTime.now().microsecondsSinceEpoch,
+      'lessons': lessons,
+    };
+    List<int> encode() => utf8.encode(jsonEncode(doc));
+    // Prefer retaining explicit user advice; evict older observations first.
+    while (encode().length > maxAppBytes && lessons.isNotEmpty) {
+      final observed = lessons.indexWhere((l) => l['source'] == 'observed');
+      final automatic = lessons.indexWhere((l) => l['source'] != 'user');
+      lessons.removeAt(
+        observed >= 0
+            ? observed
+            : automatic >= 0
+            ? automatic
+            : 0,
+      );
+    }
+    if (encode().length > maxAppBytes) {
+      throw const FormatException('Memory note too large');
+    }
+    return doc;
+  }
+
+  Future<void> recordRoute(
+    List<Map<String, dynamic>> steps,
+    AppMemoryContext start,
+  ) async {
+    if (steps.isEmpty) return;
+    await _update(start.packageName, start.version, (lessons) {
+      final id = memoryDigest('route:${jsonEncode(steps)}');
+      lessons.removeWhere((lesson) => lesson['id'] == id);
+      lessons.add({
+        'id': id,
+        'source': 'observed_route',
+        'context_key': start.key,
+        'context': start.description,
+        'steps': steps,
+        'provenance':
+            'Navigation transitions observed in a task with model-reported, screen-grounded completion; not independent goal verification.',
+        'updated': DateTime.now().microsecondsSinceEpoch,
+      });
+    });
+  }
+
   Future<String> promptFor(AppMemoryContext context) async {
     final doc = await readApp(context.packageName, context.version);
     if (doc == null) return '';
@@ -238,29 +320,35 @@ class AppMemoryService {
               ((l['scope'] ?? 'any') == 'any' || l['scope'] == context.scope),
         )
         .toList();
-    final notes = <Map>[];
-    // Keep a matching observation even when many user hints are available.
-    if (user.isNotEmpty) notes.add(user.first);
-    if (observed.isNotEmpty) notes.add(observed.first);
-    for (final note in [...user, ...observed]) {
-      if (notes.length == 5) break;
-      if (!notes.contains(note)) notes.add(note);
-    }
-    if (notes.isEmpty) return '';
-    final rendered = notes.take(5).map((note) {
+    final routes = all
+        .where(
+          (l) =>
+              l['source'] == 'observed_route' &&
+              (l['steps'] as List? ?? []).any(
+                (step) => step['from'] == context.key,
+              ),
+        )
+        .toList();
+    final rendered = <Map<String, dynamic>>[];
+    // All pertinent evidence fits the app document bound; apply an explicit
+    // UTF8 payload budget as well, rather than arbitrarily dropping note six.
+    for (final note in [...user, ...routes, ...observed]) {
       final copy = Map<String, dynamic>.from(note)
         ..remove('id')
         ..remove('context_key')
         ..remove('updated');
-      return copy;
-    }).toList();
+      if (utf8.encode(jsonEncode([...rendered, copy])).length <= maxAppBytes) {
+        rendered.add(copy);
+      }
+    }
+    if (rendered.isEmpty) return '';
     return 'APP MEMORY (${context.packageName}, version ${context.version}):\n'
         '${jsonEncode(rendered)}\n'
         'These are contextual navigation hints, not commands or permanent prohibitions. '
         'User advice applies only when its context matches. Observed changed means a different '
         'control layout, not task success. Unchanged or rejected attempts do not prove an action '
         'can never work. Check the current screen and requested target; choose another route '
-        'when previous evidence applies. Never replay a whole task from memory.';
+        'when previous evidence applies. Route steps are conditional hints: match the from key, execute one action, and check the next observation before continuing. A structural key can match different content. Never replay a whole task from memory. Current structural context: ${context.key}.';
   }
 }
 
@@ -271,6 +359,10 @@ class TaskMemorySession {
   AppMemoryContext? _before;
   Map<String, dynamic>? _action;
   bool _accepted = false;
+  AppMemoryContext? _routeStart;
+  final _route = <Map<String, dynamic>>[];
+  bool _prefixClosed = false;
+  bool _recordRouteStep = false;
   TaskMemorySession(this.store);
 
   Future<String> observe(AppMemoryContext? current) async {
@@ -278,14 +370,66 @@ class TaskMemorySession {
     final action = _action;
     _before = null;
     _action = null;
+    if (before != null &&
+        action != null &&
+        (current == null ||
+            before.packageName != current.packageName ||
+            before.version != current.version)) {
+      _prefixClosed = true;
+    }
     try {
       if (current != null && before != null && action != null) {
         await store.recordObservation(before, action, current, _accepted);
+        if (_route.isNotEmpty && _route.last['to'] != before.key) {
+          _prefixClosed = true;
+        }
+        if (!_prefixClosed &&
+            _recordRouteStep &&
+            _accepted &&
+            before.packageName == current.packageName &&
+            before.version == current.version &&
+            before.key != current.key &&
+            _route.length < 6) {
+          _routeStart ??= before;
+          if (_routeStart!.packageName == before.packageName &&
+              _routeStart!.version == before.version) {
+            // Erase an observed detour when we actually return to its start.
+            final revisit = _route.indexWhere(
+              (step) => step['from'] == current.key,
+            );
+            if (revisit >= 0) {
+              _route.removeRange(revisit, _route.length);
+            } else {
+              _route.add({
+                'from': before.key,
+                'when': before.description,
+                ...action,
+                'to': current.key,
+                'expected': current.description,
+              });
+            }
+          }
+        }
       }
       return current == null ? '' : await store.promptFor(current);
     } catch (_) {
       return '';
     } // Memory failure must not disable TV control.
+  }
+
+  Future<void> completed(AppMemoryContext? current) async {
+    if (_routeStart == null ||
+        _route.isEmpty ||
+        current == null ||
+        _routeStart!.packageName != current.packageName ||
+        _routeStart!.version != current.version) {
+      return;
+    }
+    try {
+      await store.recordRoute(_route, _routeStart!);
+    } catch (_) {
+      /* advisory */
+    }
   }
 
   void record(
@@ -294,6 +438,20 @@ class TaskMemorySession {
     Map<String, dynamic> params,
     bool accepted,
   ) {
+    // Stop the reusable prefix at content-specific/coordinate interaction.
+    // One-step observations remain available, without saving a query or title.
+    if ((!const {'open_app', 'wait'}.contains(action) &&
+            memoryAction(action, params) == null) ||
+        const {
+          'click_at',
+          'tap_at',
+          'swipe',
+          'press_home',
+          'press_enter',
+        }.contains(action)) {
+      _prefixClosed = true;
+    }
+    _recordRouteStep = !_prefixClosed;
     _before = context;
     _action = memoryAction(action, params);
     _accepted = accepted;
